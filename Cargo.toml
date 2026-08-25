@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/vecq-core", "crates/vecq-bench"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/codecoradev/vecq"
+authors = ["CodeCora <dev@codecora.dev>"]
+
+[workspace.dependencies]
+rand = "0.8"
+
+[profile.release]
+debug = false
+lto = true

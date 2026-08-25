@@ -1,0 +1,14 @@
+[package]
+name = "vecq-core"
+description = "Training-free RHDH + Lloyd-Max 4-bit vector quantization with asymmetric scoring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Intentionally zero dependencies for the core quantization path.
+
+[dev-dependencies]
+rand = { workspace = true }

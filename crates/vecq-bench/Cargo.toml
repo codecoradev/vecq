@@ -1,0 +1,19 @@
+[package]
+name = "vecq-bench"
+description = "Recall and throughput benchmarks for vecq-core vs f32 brute force"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+usearch = "2.26.1"
+vecq-core = { path = "../vecq-core" }
+
+[[bin]]
+name = "vecq-bench"
+path = "src/main.rs"
+
+[dev-dependencies]
+usearch = "2.26.1"
