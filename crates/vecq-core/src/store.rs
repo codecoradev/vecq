@@ -549,7 +549,9 @@ mod tests {
             idx.add(&rand_unit(dim, i + 90));
         }
         let q = rand_unit(dim, 1234);
+        #[cfg(target_arch = "aarch64")]
         let pq = idx.prepare_query(&q);
+        #[cfg(target_arch = "aarch64")]
         let bpv = idx.padded() / 2;
         for chunk_start in (0..12).step_by(4) {
             #[cfg(target_arch = "aarch64")]
