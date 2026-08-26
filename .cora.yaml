@@ -1,2 +1,23 @@
-review:
-  enabled: true
+# Cora Code Review Configuration
+# See: https://github.com/codecoradev/cora-cli
+
+# Provider settings — use global config (~/.cora/config.yaml)
+
+# Review focus areas: security, performance, bugs, best-practice, style
+focus:
+  - security
+  - performance
+  - bugs
+
+# Custom rules / additional instructions for the reviewer
+rules:
+  - "Determinism guardrail: the scoring path must preserve bit-identical results across platforms (NEON vs scalar). Do not suggest changes that alter float accumulation order or enable FMA contraction."
+  - "vecq-core is intentionally zero-dependency. Do not suggest adding crates to the quantization path."
+  - "Scores are converted to u32 monotonic keys (bit-flip sign trick) for NaN-safe heap ordering — this is deliberate, not an unused-cast smell."
+
+# Ignore patterns
+ignore:
+  files:
+    - "*.lock"
+    - "vendor/"
+    - "node_modules/"

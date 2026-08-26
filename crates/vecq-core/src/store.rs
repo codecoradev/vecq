@@ -147,6 +147,7 @@ impl VecqIndex {
 
         let pq = self.prepare_query(q);
         let k = k.min(self.n).max(1);
+        #[cfg(target_arch = "aarch64")]
         let bpv = self.padded / 2;
         // f32 -> u32 monotonic key (NaN-safe, preserves total order):
         // flip all bits for negatives, flip sign bit for positives.
@@ -168,6 +169,7 @@ impl VecqIndex {
                 heap.pop();
             }
         };
+        #[cfg(target_arch = "aarch64")]
         let q_rot = &pq.rotated[..self.padded];
         let mut idx = 0;
         #[cfg(target_arch = "aarch64")]
@@ -539,6 +541,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon4_matches_neon_bitwise() {
         let dim = 128;
@@ -552,7 +555,6 @@ mod tests {
         for chunk_start in (0..12).step_by(4) {
             let codes4 = &idx.codes[chunk_start * bpv..(chunk_start + 4) * bpv];
             let qslice = &pq.rotated[..idx.padded()];
-            #[cfg(target_arch = "aarch64")]
             {
                 let batched = unsafe { neon::score_neon4(codes4, qslice, &pq.lut) };
                 for v in 0..4 {
