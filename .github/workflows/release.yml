@@ -1,0 +1,98 @@
+name: Release
+
+# Release is triggered by pushing a vX.Y.Z tag.
+# Prerequisite: merge develop → main via PR before tagging (tag must be on main).
+# Publishes vecq-core to crates.io, then verifies via the crates.io API.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-main:
+    name: Verify tag is on main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check tag is on main
+        run: |
+          git fetch origin main
+          TAG_SHA=$(git rev-parse "${{ github.ref }}^{commit}")
+          MAIN_SHA=$(git rev-parse origin/main)
+          echo "Tag: $TAG_SHA"
+          echo "main: $MAIN_SHA"
+          if [ "$TAG_SHA" = "$MAIN_SHA" ]; then
+            echo "✅ Tag is main HEAD"
+          elif git merge-base --is-ancestor "$TAG_SHA" origin/main 2>/dev/null; then
+            echo "✅ Tag commit $TAG_SHA is in main history"
+          else
+            echo "::error::Tag commit $TAG_SHA is NOT on main."
+            echo "Merge develop → main via PR before tagging."
+            exit 1
+          fi
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: [verify-main]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish vecq-core
+        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }} -p vecq-core
+        continue-on-error: true
+
+      - name: Verify crates.io version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          fail=0
+          for attempt in 1 2 3 4 5; do
+            MAX=$(curl -sf -A "vecq-release-verify" "https://crates.io/api/v1/crates/vecq-core" | jq -r '.crate.max_version') || MAX=""
+            [ "$MAX" = "$VERSION" ] && break
+            echo "attempt $attempt: vecq-core at $MAX (want $VERSION), waiting..."
+            sleep 30
+          done
+          if [ "$MAX" = "$VERSION" ]; then
+            echo "✓ vecq-core $VERSION live on crates.io"
+          else
+            echo "::error::vecq-core not at $VERSION on crates.io (found: $MAX) — publish step failed silently"
+            fail=1
+          fi
+          exit $fail
+
+  release:
+    name: Create GitHub Release
+    needs: [publish-crates]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          awk "/^## \[${VER}\]/{found=1; next} /^## \[/{found=0} found" CHANGELOG.md > changelog-body.md
+          if [ ! -s changelog-body.md ]; then
+            echo "No changelog entry found for ${VER}." > changelog-body.md
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: changelog-body.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
