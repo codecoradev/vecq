@@ -1,0 +1,12 @@
+{
+  "timestamp": "2026-08-26T01:49:09.263337953Z",
+  "commit": "59a82f3",
+  "branch": "chore/cora-config",
+  "files_reviewed": 0,
+  "lines_reviewed": null,
+  "findings": {},
+  "categories": {},
+  "quality_score": 10.0,
+  "gate_status": "disabled",
+  "duration_ms": null
+}

@@ -552,7 +552,9 @@ mod tests {
         let pq = idx.prepare_query(&q);
         let bpv = idx.padded() / 2;
         for chunk_start in (0..12).step_by(4) {
+            #[cfg(target_arch = "aarch64")]
             let codes4 = &idx.codes[chunk_start * bpv..(chunk_start + 4) * bpv];
+            #[cfg(target_arch = "aarch64")]
             let qslice = &pq.rotated[..idx.padded()];
             #[cfg(target_arch = "aarch64")]
             {
