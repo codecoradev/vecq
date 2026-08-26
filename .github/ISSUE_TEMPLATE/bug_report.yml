@@ -1,85 +1,52 @@
-name: Bug report
-description: Something is broken or behaving unexpectedly
-labels: ["bug"]
+name: Bug Report
+description: Report something that works incorrectly
+labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to report a bug. Please fill in the fields below — it makes triage much faster.
+        Thanks for taking the time to report a bug!
 
-        For **security issues**, do NOT open an issue. See [SECURITY.md](https://github.com/codecoradev/uteke/blob/develop/SECURITY.md).
-
+        For **security issues**, do NOT open an issue. See [SECURITY.md](https://github.com/codecoradev/vecq/blob/develop/SECURITY.md).
   - type: input
     id: version
     attributes:
-      label: Uteke version
-      description: Run `uteke --version` or check the release you're on.
-      placeholder: "0.10.3"
+      label: vecq-core version
+      description: Check your Cargo.lock or `cargo tree -p vecq-core`.
+      placeholder: "0.1.0"
     validations:
       required: true
-
   - type: dropdown
-    id: os
+    id: platform
     attributes:
-      label: Operating system
+      label: Architecture
       options:
-        - Linux
-        - macOS (Apple Silicon)
-        - macOS (Intel)
-        - Windows
-        - Other
+        - aarch64 (NEON path)
+        - x86_64 (scalar path)
+        - other
     validations:
       required: true
-
-  - type: input
-    id: os-version
-    attributes:
-      label: OS version
-      placeholder: "Ubuntu 24.04 / macOS 15.2 / Windows 11 23H2"
-    validations:
-      required: true
-
   - type: textarea
     id: what-happened
     attributes:
       label: What happened?
-      description: A clear and concise description of the bug.
+      description: A clear description of the bug. If results look wrong, note that scoring is deterministic — include the seed and file if possible.
+      placeholder: Describe the unexpected behavior.
     validations:
       required: true
-
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A small Rust snippet that reproduces the issue.
+      placeholder: |
+        let mut idx = VecqIndex::new(768, 42);
+        ...
+    validations:
+      required: true
   - type: textarea
     id: expected
     attributes:
-      label: What did you expect to happen?
+      label: What did you expect?
     validations:
       required: true
-
-  - type: textarea
-    id: steps
-    attributes:
-      label: Steps to reproduce
-      description: Numbered list of exact steps. Include the exact command or API call.
-      placeholder: |
-        1. Run `uteke remember "test memory"`
-        2. Run `uteke recall test`
-        3. ...
-    validations:
-      required: true
-
-  - type: textarea
-    id: logs
-    attributes:
-      label: Logs / output
-      description: |
-        Paste relevant terminal output or server logs. Use `--verbose` flag for more detail.
-        For server mode: check the server logs where Uteke is running.
-
-  - type: checkboxes
-    id: checks
-    attributes:
-      label: Before submitting
-      options:
-        - label: I searched existing issues and didn't find a duplicate
-          required: true
-        - label: I am running the latest version
-          required: false
