@@ -147,6 +147,8 @@ impl VecqIndex {
 
         let pq = self.prepare_query(q);
         let k = k.min(self.n).max(1);
+        #[cfg(target_arch = "aarch64")]
+        let bpv = self.padded / 2;
         // f32 -> u32 monotonic key (NaN-safe, preserves total order):
         // flip all bits for negatives, flip sign bit for positives.
         let key = |s: f32| -> u32 {
