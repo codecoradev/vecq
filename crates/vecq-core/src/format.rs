@@ -71,7 +71,7 @@ fn f32_to_f16_bits(x: f32) -> u16 {
         out
     } else {
         // Subnormal half
-        let mut m = mant | 0x80_0000; // implicit leading 1
+        let m = mant | 0x80_0000; // implicit leading 1
         let shift = (-unbiased - 14 + 13) as u32;
         if shift >= 32 {
             return sign;
