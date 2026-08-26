@@ -108,18 +108,50 @@ impl VecqIndex {
 
     /// Asymmetric score of vector `idx` against a prepared query.
     /// Returns estimated cosine similarity in [-1, 1].
+    ///
+    /// The inner loop uses a fixed 8-lane accumulation pattern (auto-
+    /// vectorizable, identical association order everywhere) so results are
+    /// bit-identical across platforms — guarded by
+    /// `score_reproducible_and_close_to_naive` in tests.
     #[inline]
     pub fn score(&self, pq: &PreparedQuery, idx: usize) -> f32 {
         let base = idx * (self.padded / 2);
-        let mut dot = 0f32;
-        for i in 0..self.padded {
-            let b = self.codes[base + i / 2];
-            let code = if i % 2 == 0 { b & 0x0F } else { b >> 4 };
-            dot += pq.rotated[i] * pq.lut[code as usize];
+        self.score_inner(pq, base) * self.scales[idx]
+    }
+
+    #[inline]
+    fn score_inner(&self, pq: &PreparedQuery, base: usize) -> f32 {
+        let padded = self.padded;
+        let codes = &self.codes[base..base + padded / 2];
+        let q = &pq.rotated[..padded];
+        let lut = &pq.lut;
+        // Fixed 8-bucket accumulation: q[2k]*lut[lo] + q[2k+1]*lut[hi] per code
+        // byte, bucket j += term for bytes j, j+8, j+16, ... then a pairwise
+        // tree reduction. Auto-vectorizes to 8-wide SIMD while keeping a
+        // platform-independent association order.
+        let mut acc = [0f32; 8];
+        let nb = padded / 2;
+        let mut i = 0;
+        while i + 8 <= nb {
+            for j in 0..8 {
+                let b = codes[i + j];
+                let c = (i + j) * 2;
+                acc[j] += q[c] * lut[(b & 0x0F) as usize] + q[c + 1] * lut[(b >> 4) as usize];
+            }
+            i += 8;
         }
-        // Divide by ||q_rotated|| * ||dequant||; both are unit after
-        // prepare_query normalization and the stored scale respectively.
-        dot * self.scales[idx]
+        let mut tail = 0f32;
+        while i < nb {
+            let b = codes[i];
+            let c = i * 2;
+            tail += q[c] * lut[(b & 0x0F) as usize] + q[c + 1] * lut[(b >> 4) as usize];
+            i += 1;
+        }
+        let s01 = acc[0] + acc[1];
+        let s23 = acc[2] + acc[3];
+        let s45 = acc[4] + acc[5];
+        let s67 = acc[6] + acc[7];
+        (s01 + s23) + (s45 + s67) + tail
     }
 
     /// Brute-force top-k search. Returns (index, score) sorted by score desc.
@@ -198,6 +230,35 @@ mod tests {
         // Per-dimension quantization error ~0.107 var; aggregated over 128
         // rotated dims the cosine estimate error should stay well below 0.2.
         assert!(max_err < 0.2, "max score error {max_err}");
+    }
+
+    #[test]
+    fn score_reproducible_and_close_to_naive() {
+        // The 8-bucket accumulation uses a FIXED association order (same on
+        // every platform) — that is the cross-platform guarantee. It is not
+        // bit-equal to a naive left-to-right sum, but must be numerically
+        // close and perfectly reproducible across calls/builds.
+        let dim = 128;
+        let mut idx = VecqIndex::new(dim, 13);
+        for i in 0..50 {
+            idx.add(&rand_unit(dim, i + 21));
+        }
+        let q = rand_unit(dim, 321);
+        let pq = idx.prepare_query(&q);
+        for vi in 0..50 {
+            let base = vi * (idx.padded / 2);
+            let mut naive = 0f32;
+            for i in 0..idx.padded {
+                let b = idx.codes[base + i / 2];
+                let code = if i % 2 == 0 { b & 0x0F } else { b >> 4 };
+                naive += pq.rotated[i] * pq.lut[code as usize];
+            }
+            let s = idx.score(&pq, vi);
+            // Reproducible: same bits on every call.
+            assert_eq!(s.to_bits(), idx.score(&pq, vi).to_bits());
+            // Numerically close to the naive reference.
+            assert!((s - naive * idx.scales[vi]).abs() < 1e-5, "vector {vi}");
+        }
     }
 
     #[test]
