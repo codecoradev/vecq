@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.1] — 2026-08-26
+
+### Added
+- Release pipeline: push a `vX.Y.Z` tag on `main` to publish `vecq-core` to crates.io and create the GitHub Release (adapted from the uteke release workflow).
+
 ## [0.1.0] — 2026-08-26
 
 First public release. Training-free 4-bit vector quantization and search.
