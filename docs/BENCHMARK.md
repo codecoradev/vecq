@@ -34,7 +34,7 @@ Recall@1 = 0.910. Recall gate for the spike was **≥ 0.95** → **passed**.
 
 ### What vecq wins
 - **Memory**: 514 B/vector vs 3,072 B — a **5.98x** reduction with no training.
-  For uteke-mobile's 300 MB index this projects to ~50 MB.
+  A 300 MB f32 index projects to ~50 MB (e.g. a 768-dim index of ~100k memories).
 - **Build time**: 14x faster than usearch HNSW construction (64 ms vs 893 ms) —
   no graph to build, just quantize.
 - **Determinism**: fixed-order accumulation over packed codes; same file →

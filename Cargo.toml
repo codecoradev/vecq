@@ -3,10 +3,13 @@ resolver = "2"
 members = ["crates/vecq-core", "crates/vecq-bench"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/codecoradev/vecq"
+homepage = "https://github.com/codecoradev/vecq"
+keywords = ["vector", "quantization", "search", "embedded", "no-std"]
+categories = ["algorithms", "data-structures", "science"]
 authors = ["CodeCora <dev@codecora.dev>"]
 
 [workspace.dependencies]

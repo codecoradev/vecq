@@ -1,0 +1,52 @@
+name: Bug Report
+description: Report something that works incorrectly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug!
+
+        For **security issues**, do NOT open an issue. See [SECURITY.md](https://github.com/codecoradev/vecq/blob/develop/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: vecq-core version
+      description: Check your Cargo.lock or `cargo tree -p vecq-core`.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Architecture
+      options:
+        - aarch64 (NEON path)
+        - x86_64 (scalar path)
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug. If results look wrong, note that scoring is deterministic — include the seed and file if possible.
+      placeholder: Describe the unexpected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: A small Rust snippet that reproduces the issue.
+      placeholder: |
+        let mut idx = VecqIndex::new(768, 42);
+        ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
