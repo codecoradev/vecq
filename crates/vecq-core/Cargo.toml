@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+readme = "../../README.md"
+exclude = ["benches"]
 
 [dependencies]
 # Intentionally zero dependencies for the core quantization path.
