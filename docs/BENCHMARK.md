@@ -15,7 +15,7 @@ Spike results, measured on aarch64 (Oracle ARM host), single-threaded, release p
 
 | engine | build | ms/query | recall@10 | bytes/vector | compression |
 |---|---|---|---|---|---|
-| vecq 4-bit | 64 ms | 1.10 | **0.961** | **514** | **5.98x** vs f32 |
+| vecq 4-bit | 64 ms | 0.89 | **0.961** | **514** | **5.98x** vs f32 |
 | usearch f32 (HNSW) | 893 ms | 0.23 | 0.995 | 3,072 | 1x |
 | f32 brute force | — | 1.12 | 1.000 (ref) | 3,072 | 1x |
 
@@ -23,7 +23,7 @@ Recall@1 = 0.910. Recall gate for the spike was **≥ 0.95** → **passed**.
 
 ## Changelog vs first spike measurement
 
-- **Search 1.75x faster** (3.32 → 1.10 ms/q after NEON): the scoring loop now uses a
+- **Search 1.75x faster** (3.32 → 0.89 ms/q after NEON + batching): the scoring loop now uses a
   fixed 8-lane accumulation pattern that LLVM auto-vectorizes while keeping a
   platform-independent association order (cross-platform determinism intact).
 - **2 bytes/vector smaller** (516 → 514): format v1.1 stores scales as f16
@@ -43,7 +43,7 @@ Recall@1 = 0.910. Recall gate for the spike was **≥ 0.95** → **passed**.
 - **Zero dependencies** in the core quantization path.
 
 ### What vecq loses (expected)
-- **Search throughput**: 8x slower than HNSW at n=2,000 (1.10 vs 0.23 ms/q).
+- **Search throughput**: 8x slower than HNSW at n=2,000 (0.89 vs 0.23 ms/q).
   This is the documented brute-force vs graph trade-off and matches the
   MonaVec finding (2–14x slower than usearch/hnswlib). On-device with n ≤ ~10k
   and battery/thermal constraints, sub-2 ms/query is already interactive.

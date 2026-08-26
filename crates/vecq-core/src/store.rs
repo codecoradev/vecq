@@ -137,14 +137,69 @@ impl VecqIndex {
     }
 
     /// Brute-force top-k search. Returns (index, score) sorted by score desc.
+    ///
+    /// Uses a bounded min-heap of size k (no O(n log n) sort, no O(n)
+    /// allocation per query): push while the heap is not full, then only
+    /// push-and-pop when the candidate beats the current k-th score.
     pub fn search(&self, q: &[f32], k: usize) -> Vec<(usize, f32)> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
         let pq = self.prepare_query(q);
-        let k = k.min(self.n);
-        let mut scored: Vec<(usize, f32)> =
-            (0..self.n).map(|idx| (idx, self.score(&pq, idx))).collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("no NaN scores"));
-        scored.truncate(k);
-        scored
+        let k = k.min(self.n).max(1);
+        let bpv = self.padded / 2;
+        // f32 -> u32 monotonic key (NaN-safe, preserves total order):
+        // flip all bits for negatives, flip sign bit for positives.
+        let key = |s: f32| -> u32 {
+            let b = s.to_bits();
+            if b & 0x8000_0000 != 0 {
+                !b
+            } else {
+                b ^ 0x8000_0000
+            }
+        };
+        let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::with_capacity(k + 1);
+        let consider = |s: f32, idx: usize, heap: &mut BinaryHeap<Reverse<(u32, usize)>>| {
+            let ks = key(s);
+            if heap.len() < k {
+                heap.push(Reverse((ks, idx)));
+            } else if ks > heap.peek().map(|r| r.0 .0).unwrap_or(0) {
+                heap.push(Reverse((ks, idx)));
+                heap.pop();
+            }
+        };
+        let q_rot = &pq.rotated[..self.padded];
+        let mut idx = 0;
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Batch 4 vectors per pass: shared q loads + LUT setup.
+            while idx + 4 <= self.n {
+                let codes4 = &self.codes[idx * bpv..(idx + 4) * bpv];
+                let raw = unsafe { neon::score_neon4(codes4, q_rot, &pq.lut) };
+                for (v, &r) in raw.iter().enumerate() {
+                    consider(r * self.scales[idx + v], idx + v, &mut heap);
+                }
+                idx += 4;
+            }
+        }
+        while idx < self.n {
+            consider(self.score(&pq, idx), idx, &mut heap);
+            idx += 1;
+        }
+        // Inverse of `key`: undo the sign flip to recover the exact f32 bits.
+        let key_undo = |k: u32| -> u32 {
+            if k & 0x8000_0000 != 0 {
+                k ^ 0x8000_0000 // was a positive float
+            } else {
+                !k // was a negative float
+            }
+        };
+        let mut out: Vec<(usize, f32)> = heap
+            .into_iter()
+            .map(|r| (r.0 .1, f32::from_bits(key_undo(r.0 .0))))
+            .collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("no NaN scores"));
+        out
     }
 }
 
@@ -294,6 +349,80 @@ mod neon {
         let s67 = acc[6] + acc[7];
         (s01 + s23) + (s45 + s67) + tail
     }
+
+    /// Score 4 consecutive vectors at once, amortizing the q loads and LUT
+    /// table setup across all 4. Each vector accumulates in the exact same
+    /// per-lane order as [`score_neon`], so results are bit-identical.
+    ///
+    /// Returns raw (pre-scale) scores; the caller multiplies by `scales`.
+    #[inline]
+    pub unsafe fn score_neon4(codes4: &[u8], q: &[f32], lut: &[f32; 16]) -> [f32; 4] {
+        let mut bytes = [0u8; 64];
+        for (c, &v) in lut.iter().enumerate() {
+            bytes[c * 4..c * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let tbl = uint8x16x4_t(
+            vld1q_u8(bytes[0..16].as_ptr()),
+            vld1q_u8(bytes[16..32].as_ptr()),
+            vld1q_u8(bytes[32..48].as_ptr()),
+            vld1q_u8(bytes[48..64].as_ptr()),
+        );
+        let nb = codes4.len() / 4; // bytes per vector
+        let mut acc_lo = [vdupq_n_f32(0.0); 4];
+        let mut acc_hi = [vdupq_n_f32(0.0); 4];
+        let mut i = 0;
+        while i + 8 <= nb {
+            // Shared q loads for this block: q[2i .. 2i+16), deinterleaved.
+            let q0 = vld1q_f32(q.as_ptr().add(i * 2));
+            let q1 = vld1q_f32(q.as_ptr().add(i * 2 + 4));
+            let q2 = vld1q_f32(q.as_ptr().add(i * 2 + 8));
+            let q3 = vld1q_f32(q.as_ptr().add(i * 2 + 12));
+            let q_even_lo = vuzp1q_f32(q0, q1);
+            let q_even_hi = vuzp1q_f32(q2, q3);
+            let q_odd_lo = vuzp2q_f32(q0, q1);
+            let q_odd_hi = vuzp2q_f32(q2, q3);
+            for v in 0..4 {
+                let b8 = vld1_u8(codes4.as_ptr().add(v * nb + i));
+                let lo = vand_u8(b8, vdup_n_u8(0x0F));
+                let hi = vshr_n_u8(b8, 4);
+                let nibbles = vcombine_u8(lo, hi);
+                let g = gather16(tbl, nibbles);
+                let t_lo = vaddq_f32(vmulq_f32(q_even_lo, g[0]), vmulq_f32(q_odd_lo, g[2]));
+                let t_hi = vaddq_f32(vmulq_f32(q_even_hi, g[1]), vmulq_f32(q_odd_hi, g[3]));
+                acc_lo[v] = vaddq_f32(acc_lo[v], t_lo);
+                acc_hi[v] = vaddq_f32(acc_hi[v], t_hi);
+            }
+            i += 8;
+        }
+        let mut out = [0f32; 4];
+        for v in 0..4 {
+            // Same lane extraction + pairwise reduction as score_neon.
+            let mut a = [0f32; 8];
+            a[0] = vgetq_lane_f32(acc_lo[v], 0);
+            a[1] = vgetq_lane_f32(acc_lo[v], 1);
+            a[2] = vgetq_lane_f32(acc_lo[v], 2);
+            a[3] = vgetq_lane_f32(acc_lo[v], 3);
+            a[4] = vgetq_lane_f32(acc_hi[v], 0);
+            a[5] = vgetq_lane_f32(acc_hi[v], 1);
+            a[6] = vgetq_lane_f32(acc_hi[v], 2);
+            a[7] = vgetq_lane_f32(acc_hi[v], 3);
+            // Scalar tail for the last (< 8) code bytes.
+            let mut tail = 0f32;
+            let mut j = i;
+            while j < nb {
+                let b = codes4[v * nb + j];
+                let c = j * 2;
+                tail += q[c] * lut[(b & 0x0F) as usize] + q[c + 1] * lut[(b >> 4) as usize];
+                j += 1;
+            }
+            let s01 = a[0] + a[1];
+            let s23 = a[2] + a[3];
+            let s45 = a[4] + a[5];
+            let s67 = a[6] + a[7];
+            out[v] = (s01 + s23) + (s45 + s67) + tail;
+        }
+        out
+    }
 }
 
 /// A query preprocessed in the quantized domain.
@@ -406,6 +535,36 @@ mod tests {
             #[cfg(not(target_arch = "aarch64"))]
             {
                 let _ = (base, codes, qslice);
+            }
+        }
+    }
+
+    #[test]
+    fn neon4_matches_neon_bitwise() {
+        let dim = 128;
+        let mut idx = VecqIndex::new(dim, 91);
+        for i in 0..12 {
+            idx.add(&rand_unit(dim, i + 90));
+        }
+        let q = rand_unit(dim, 1234);
+        let pq = idx.prepare_query(&q);
+        let bpv = idx.padded() / 2;
+        for chunk_start in (0..12).step_by(4) {
+            let codes4 = &idx.codes[chunk_start * bpv..(chunk_start + 4) * bpv];
+            let qslice = &pq.rotated[..idx.padded()];
+            #[cfg(target_arch = "aarch64")]
+            {
+                let batched = unsafe { neon::score_neon4(codes4, qslice, &pq.lut) };
+                for v in 0..4 {
+                    let single = unsafe {
+                        neon::score_neon(&codes4[v * bpv..(v + 1) * bpv], qslice, &pq.lut)
+                    };
+                    assert_eq!(
+                        batched[v].to_bits(),
+                        single.to_bits(),
+                        "chunk {chunk_start} vec {v}: neon4 diverged from neon"
+                    );
+                }
             }
         }
     }
