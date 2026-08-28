@@ -81,6 +81,46 @@ bound). Rosetta-emulated runs are explicitly **not** used as x86_64
 benchmarks — Rosetta neither advertises AVX2 via CPUID nor reflects native
 throughput.
 
+## Head-to-head vs other 4-bit quantizers (issue #28)
+
+Harness: `cargo run -p vecq-bench --release --bin vs_quantizers` — identical
+synthetic clustered dataset for every engine (n=10k/1k, 200 queries), exact
+f32 cosine ground truth, aarch64 (Apple Silicon) single-threaded, release.
+Recall numbers are deterministic across runs; timings vary ~±20%.
+
+| dataset | engine | bytes/vec | build ms | ms/query | recall@10 |
+|---|---|---|---|---|---|
+| n=10k, dim=768 | f32 brute (ref) | 3072 | — | 8.9 | 1.000 |
+| | **vecq 4-bit** | 514 | **94** | **2.1–2.7** | **0.840** |
+| | TurboQuant-MSE 4-bit (SDC) | 384 | 1080 | 15.0–15.7 | 0.798 |
+| | RaBitQ 4-bit brute (FHT-Kac) | 392 | 185–250 | 37.9–39.3 | 0.827 |
+| n=10k, dim=384 | **vecq 4-bit** | 258 | **41** | **~1.0** | **0.846** |
+| | TurboQuant-MSE 4-bit (SDC) | 192 | ~270 | 7.3–9.0 | 0.813 |
+| | RaBitQ 4-bit brute (FHT-Kac) | 200 | 85–100 | 18.6–29.4 | 0.843 |
+| n=1k, dim=384 | **vecq 4-bit** | 258 | 7 | **0.19–0.34** | **0.875** |
+| | TurboQuant-MSE 4-bit (SDC) | 192 | ~275 | ~1.1 | 0.844 |
+| | RaBitQ 4-bit brute (FHT-Kac) | 200 | 18 | ~2.3 | 0.873 |
+
+Methodology notes (honest labeling):
+- Recall is **not** comparable to the 0.958 EmbeddingGemma table above — this
+  dataset is the harder synthetic clustered set used by `vecq-bench`.
+- vecq scans 4-bit codes with the explicit NEON kernel + 4-vector batching.
+- TurboQuant-MSE: symmetric distance computation (both query and database in
+  the shared Lloyd-Max codebook domain) — the crate exposes no ADC path or
+  rotation accessor; codebook bytes are excluded from bytes/vec.
+- RaBitQ: `rabitq-rs` 0.9 brute-force index as implemented (train uses its
+  internal rayon pool); bytes/vec = 4-bit codes + two per-vector f32 norms.
+- vecq bytes/vec include the per-vector f16 scale and power-of-two padding
+  (768 → 1024, a ~25% padding tax the competitors don't pay).
+- x86_64 numbers pending native measurement (see scoring-path table).
+
+**Go/no-go for follow-ups:** vecq already leads both competitors on scan
+speed (5–14x) and recall at dim 768. Residual quantization (#23) should
+therefore be evaluated as a **recall lift at the same 514 B budget** (e.g.
+4-bit + residual at equal total bytes vs the competitors' plain 4-bit), and
+the binary-signature cascade (#22) remains the scan-speed lever for larger
+n. Verdict: proceed with both, benchmarked against this baseline.
+
 ## Conclusion
 
 The spike validates the technique: training-free 4-bit RHDH + Lloyd-Max
