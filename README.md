@@ -50,6 +50,12 @@ index.relabel(1001, 2002);                 // rename a key in place
 index.remove_keyed(2002);                  // tombstone; `compact()` reclaims the slot
 let keyed_hits: Vec<(u64, f32)> = index.search_keyed(&query, 10);
 
+// Cascade search (opt-in approximate): rank by cheap 2-bit codes, rescore
+// the closest r with the full 4-bit path. Deterministic; r >= n is exactly
+// `search`. Prefilter quality is data-dependent — measure recall vs r.
+index.enable_cascade();
+let approx: Vec<(usize, f32)> = index.search_cascade(&query, 10, 200);
+
 // Single-file persistence, deterministic across platforms.
 // Tombstones are dropped on disk; keys persist (format v1.3 keyed table).
 let bytes = index.to_bytes();
