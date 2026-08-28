@@ -3,6 +3,7 @@
 
 use crate::lloyd;
 use crate::rhdh::{padded_dim, Rhdh};
+use std::collections::HashMap;
 
 /// A quantized vector database in memory.
 ///
@@ -10,6 +11,14 @@ use crate::rhdh::{padded_dim, Rhdh};
 /// (computed after RHDH rotation) plus one f32 correction factor. The score
 /// against an f32 query is an unbiased estimate of the cosine similarity
 /// after undoing the per-vector quantization scale.
+///
+/// Vectors can be stored anonymously via [`VecqIndex::add`] or under a
+/// caller-chosen `u64` key via [`VecqIndex::add_keyed`]. Keyed vectors can be
+/// removed in place (tombstoned); tombstoned slots keep their storage but are
+/// skipped by searches and dropped by [`VecqIndex::compact`] and by
+/// [`VecqIndex::to_bytes`](crate::format). Slot indices stay stable until a
+/// compaction, so integrators can treat a slot as a transient handle while
+/// keys are the durable identity.
 pub struct VecqIndex {
     pub(crate) dim: usize,
     padded: usize,
@@ -17,7 +26,11 @@ pub struct VecqIndex {
     transform: Rhdh,
     pub(crate) codes: Vec<u8>, // n * padded/2 nibbles, low nibble = dim i*2
     pub(crate) scales: Vec<f32>, // per-vector dequantization scale
-    pub(crate) n: usize,
+    pub(crate) n: usize,       // total slots in use (live + tombstoned)
+    keys: Vec<Option<u64>>,    // slot -> caller key (keyed slots only)
+    key_to_slot: HashMap<u64, usize>,
+    alive: Vec<bool>, // slot -> not tombstoned
+    live: usize,      // number of non-tombstoned slots
 }
 
 impl VecqIndex {
@@ -33,15 +46,31 @@ impl VecqIndex {
             codes: Vec::new(),
             scales: Vec::new(),
             n: 0,
+            keys: Vec::new(),
+            key_to_slot: HashMap::new(),
+            alive: Vec::new(),
+            live: 0,
         }
     }
 
+    /// Number of live (searchable) vectors.
     pub fn len(&self) -> usize {
-        self.n
+        self.live
     }
 
     pub fn is_empty(&self) -> bool {
-        self.n == 0
+        self.live == 0
+    }
+
+    /// Total slots in use, including tombstoned ones
+    /// (`slots() == len() + tombstones()`).
+    pub fn slots(&self) -> usize {
+        self.n
+    }
+
+    /// Number of tombstoned slots awaiting [`VecqIndex::compact`].
+    pub fn tombstones(&self) -> usize {
+        self.n - self.live
     }
 
     pub fn dim(&self) -> usize {
@@ -57,8 +86,134 @@ impl VecqIndex {
         self.padded
     }
 
+    // -- crate-internal accessors used by the persistence format ---------
+
+    pub(crate) fn padded_dim(&self) -> usize {
+        self.padded
+    }
+
+    pub(crate) fn live_slots(&self) -> usize {
+        self.live
+    }
+
+    pub(crate) fn slot_alive(&self, slot: usize) -> bool {
+        self.alive[slot]
+    }
+
+    pub(crate) fn slot_scale(&self, slot: usize) -> f32 {
+        self.scales[slot]
+    }
+
+    pub(crate) fn slot_codes(&self, slot: usize, bpv: usize) -> &[u8] {
+        &self.codes[slot * bpv..(slot + 1) * bpv]
+    }
+
+    /// Mark the index as holding `count` dense (all-live, keyless) slots;
+    /// used after loading from the file format.
+    pub(crate) fn init_dense(&mut self, count: usize) {
+        self.keys = vec![None; count];
+        self.alive = vec![true; count];
+        self.key_to_slot.clear();
+        self.live = count;
+    }
+
     /// Quantize and add one vector (any norm; normalized internally).
-    pub fn add(&mut self, v: &[f32]) {
+    ///
+    /// Returns the slot index holding the vector (stable until compaction).
+    pub fn add(&mut self, v: &[f32]) -> usize {
+        self.append_slot(v, None)
+    }
+
+    /// Quantize and add one vector under a caller-chosen `u64` key.
+    ///
+    /// If `key` already exists, the vector is replaced in place (the slot
+    /// index is preserved, matching usearch's insert semantics). Otherwise a
+    /// new slot is appended. Returns the slot index holding the vector.
+    pub fn add_keyed(&mut self, key: u64, v: &[f32]) -> usize {
+        if let Some(&slot) = self.key_to_slot.get(&key) {
+            let scale = self.encode_into(slot * (self.padded / 2), v);
+            self.scales[slot] = scale;
+            return slot;
+        }
+        self.append_slot(v, Some(key))
+    }
+
+    /// Remove a keyed vector. The slot becomes a tombstone: its storage is
+    /// kept (slot indices stay stable) but searches skip it until
+    /// [`VecqIndex::compact`]. Returns `false` if the key is unknown.
+    pub fn remove_keyed(&mut self, key: u64) -> bool {
+        match self.key_to_slot.remove(&key) {
+            Some(slot) => {
+                self.alive[slot] = false;
+                self.keys[slot] = None;
+                self.live -= 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Look up the key stored at `slot` (`None` for anonymous slots,
+    /// tombstones, or out-of-range indices).
+    pub fn key_of(&self, slot: usize) -> Option<u64> {
+        self.keys.get(slot).copied().flatten()
+    }
+
+    /// Whether `key` currently identifies a live vector.
+    pub fn contains_key(&self, key: u64) -> bool {
+        self.key_to_slot.contains_key(&key)
+    }
+
+    /// Rebuild the index in place, dropping tombstoned slots.
+    ///
+    /// All remaining vectors keep their keys; **slot indices shift** to become
+    /// dense (0..len). Search results are unchanged.
+    pub fn compact(&mut self) {
+        if self.live == self.n {
+            return;
+        }
+        let bpv = self.padded / 2;
+        let mut codes = Vec::with_capacity(self.live * bpv);
+        let mut scales = Vec::with_capacity(self.live);
+        let mut keys = Vec::with_capacity(self.live);
+        let mut alive = Vec::with_capacity(self.live);
+        self.key_to_slot.clear();
+        for slot in 0..self.n {
+            if self.alive[slot] {
+                codes.extend_from_slice(&self.codes[slot * bpv..(slot + 1) * bpv]);
+                scales.push(self.scales[slot]);
+                if let Some(key) = self.keys[slot] {
+                    self.key_to_slot.insert(key, keys.len());
+                }
+                keys.push(self.keys[slot]);
+                alive.push(true);
+            }
+        }
+        self.codes = codes;
+        self.scales = scales;
+        self.keys = keys;
+        self.alive = alive;
+        self.n = self.live;
+    }
+
+    /// Append one vector as a new slot; returns the slot index.
+    fn append_slot(&mut self, v: &[f32], key: Option<u64>) -> usize {
+        let slot = self.n;
+        let scale = self.encode_into(slot * (self.padded / 2), v);
+        self.scales.push(scale);
+        self.keys.push(key);
+        if let Some(key) = key {
+            self.key_to_slot.insert(key, slot);
+        }
+        self.alive.push(true);
+        self.n += 1;
+        self.live += 1;
+        slot
+    }
+
+    /// Quantize `v` into the code bytes starting at `base` (extending
+    /// `codes` when appending); returns the unit-norm correction scale.
+    fn encode_into(&mut self, base: usize, v: &[f32]) -> f32 {
         assert_eq!(v.len(), self.dim, "vector dim mismatch");
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(norm > 0.0, "zero vector");
@@ -69,24 +224,25 @@ impl VecqIndex {
 
         // Quantize to 4-bit codes, nibble-packed.
         let bytes_per_vec = self.padded / 2;
-        let base = self.codes.len();
-        self.codes.resize(base + bytes_per_vec, 0);
+        if self.codes.len() < base + bytes_per_vec {
+            self.codes.resize(base + bytes_per_vec, 0);
+        }
         let mut sum_sq = 0f32;
         for (i, &x) in rotated.iter().enumerate() {
             let code = lloyd::quantize_4bit(x);
             let b = base + i / 2;
-            if i % 2 == 0 {
-                self.codes[b] |= code;
+            let byte = if i % 2 == 0 {
+                (self.codes[b] & 0xF0) | code
             } else {
-                self.codes[b] |= code << 4;
-            }
+                (self.codes[b] & 0x0F) | (code << 4)
+            };
+            self.codes[b] = byte;
             sum_sq += lloyd::dequantize_4bit(code).powi(2);
         }
 
         // Scale so that the stored vector is unit-norm: dequantized vector q
         // has norm sqrt(sum_sq); asymmetric scoring multiplies by 1/sqrt(sum_sq).
-        self.scales.push(1.0 / sum_sq.sqrt());
-        self.n += 1;
+        1.0 / sum_sq.sqrt()
     }
 
     /// Prepare an f32 query in rotated space (call once per query).
@@ -136,17 +292,31 @@ impl VecqIndex {
         }
     }
 
-    /// Brute-force top-k search. Returns (index, score) sorted by score desc.
+    /// Brute-force top-k search. Returns (slot index, score) sorted by score
+    /// desc. Tombstoned slots are skipped.
     ///
     /// Uses a bounded min-heap of size k (no O(n log n) sort, no O(n)
     /// allocation per query): push while the heap is not full, then only
     /// push-and-pop when the candidate beats the current k-th score.
     pub fn search(&self, q: &[f32], k: usize) -> Vec<(usize, f32)> {
+        self.search_slots(q, k)
+    }
+
+    /// Keyed variant of [`VecqIndex::search`]: returns (key, score) sorted by
+    /// score desc, restricted to live keyed vectors.
+    pub fn search_keyed(&self, q: &[f32], k: usize) -> Vec<(u64, f32)> {
+        self.search_slots(q, k)
+            .into_iter()
+            .filter_map(|(slot, s)| self.key_of(slot).map(|key| (key, s)))
+            .collect()
+    }
+
+    fn search_slots(&self, q: &[f32], k: usize) -> Vec<(usize, f32)> {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
 
         let pq = self.prepare_query(q);
-        let k = k.min(self.n).max(1);
+        let k = k.min(self.live).max(1);
         #[cfg(target_arch = "aarch64")]
         let bpv = self.padded / 2;
         // f32 -> u32 monotonic key (NaN-safe, preserves total order):
@@ -174,18 +344,25 @@ impl VecqIndex {
         let mut idx = 0;
         #[cfg(target_arch = "aarch64")]
         {
-            // Batch 4 vectors per pass: shared q loads + LUT setup.
+            // Batch 4 vectors per pass: shared q loads + LUT setup. Tombstoned
+            // slots are still scored (keeping the batch dense) but filtered
+            // before entering the heap.
             while idx + 4 <= self.n {
                 let codes4 = &self.codes[idx * bpv..(idx + 4) * bpv];
                 let raw = unsafe { neon::score_neon4(codes4, q_rot, &pq.lut) };
                 for (v, &r) in raw.iter().enumerate() {
-                    consider(r * self.scales[idx + v], idx + v, &mut heap);
+                    let si = idx + v;
+                    if self.alive[si] {
+                        consider(r * self.scales[si], si, &mut heap);
+                    }
                 }
                 idx += 4;
             }
         }
         while idx < self.n {
-            consider(self.score(&pq, idx), idx, &mut heap);
+            if self.alive[idx] {
+                consider(self.score(&pq, idx), idx, &mut heap);
+            }
             idx += 1;
         }
         // Inverse of `key`: undo the sign flip to recover the exact f32 bits.
@@ -592,5 +769,155 @@ mod tests {
         let mut idx = VecqIndex::new(dim, 1);
         idx.add(&rand_unit(dim, 11));
         assert_eq!(idx.codes.len(), 512 / 2);
+    }
+
+    #[test]
+    fn keyed_add_search_remove() {
+        let dim = 64;
+        let mut idx = VecqIndex::new(dim, 5);
+        for i in 0..50u64 {
+            idx.add_keyed(1000 + i, &rand_unit(dim, i * 17 + 3));
+        }
+        assert_eq!(idx.len(), 50);
+        assert!(idx.contains_key(1000));
+        assert!(!idx.contains_key(999));
+
+        let q = rand_unit(dim, 77);
+        let keyed = idx.search_keyed(&q, 5);
+        assert_eq!(keyed.len(), 5);
+        for w in keyed.windows(2) {
+            assert!(w[0].1 >= w[1].1);
+        }
+        // Keys from search_keyed must all exist and match positional results.
+        let positional = idx.search(&q, 5);
+        for ((key, ks), (slot, ps)) in keyed.iter().zip(positional.iter()) {
+            assert_eq!(key, &idx.key_of(*slot).unwrap());
+            assert_eq!(ks.to_bits(), ps.to_bits());
+        }
+
+        // Remove the top hit: it must vanish from results, others keep scores.
+        let top_key = keyed[0].0;
+        assert!(idx.remove_keyed(top_key));
+        assert!(!idx.remove_keyed(top_key), "second remove is a no-op");
+        assert!(!idx.remove_keyed(12345), "unknown key returns false");
+        assert_eq!(idx.len(), 49);
+        assert_eq!(idx.tombstones(), 1);
+        let keyed2 = idx.search_keyed(&q, 5);
+        assert!(!keyed2.iter().any(|(k, _)| *k == top_key));
+        for (k, s) in keyed2.iter() {
+            let old = keyed.iter().find(|(ok, _)| ok == k).map(|(_, os)| *os);
+            if let Some(os) = old {
+                assert_eq!(s.to_bits(), os.to_bits(), "key {k} score changed");
+            }
+        }
+    }
+
+    #[test]
+    fn keyed_add_same_key_replaces() {
+        let dim = 32;
+        let mut idx = VecqIndex::new(dim, 9);
+        idx.add_keyed(7, &rand_unit(dim, 101));
+        idx.add_keyed(7, &rand_unit(dim, 202));
+        assert_eq!(idx.len(), 1, "replace must not grow the index");
+        assert_eq!(idx.tombstones(), 0);
+        // The stored vector is the second one: query near it, key 7 wins.
+        let q = rand_unit(dim, 202);
+        let res = idx.search_keyed(&q, 1);
+        assert_eq!(res[0].0, 7);
+    }
+
+    #[test]
+    fn keyed_slot_indices_stay_stable_across_remove_and_serialize() {
+        let dim = 64;
+        let mut idx = VecqIndex::new(dim, 15);
+        for i in 0..20u64 {
+            idx.add_keyed(i, &rand_unit(dim, i + 300));
+        }
+        let q = rand_unit(dim, 404);
+        let before = idx.search(&q, 20);
+        // Remove two vectors: remaining slot indices must not shift.
+        idx.remove_keyed(idx.key_of(before[0].0).unwrap());
+        idx.remove_keyed(idx.key_of(before[5].0).unwrap());
+        let after = idx.search(&q, 20);
+        assert_eq!(after.len(), 18);
+        for (slot, s) in &after {
+            let old = before.iter().find(|(os, _)| os == slot);
+            assert!(old.is_some(), "slot {slot} moved after remove");
+            assert_eq!(old.unwrap().1.to_bits(), s.to_bits());
+        }
+        // Serializing drops tombstones on disk but must not disturb memory.
+        let bytes = idx.to_bytes();
+        let disk = VecqIndex::from_bytes(&bytes).unwrap();
+        assert_eq!(disk.len(), 18);
+        assert_eq!(idx.search(&q, 20), after, "in-memory results unchanged");
+    }
+
+    #[test]
+    fn compact_drops_tombstones_and_preserves_results() {
+        let dim = 64;
+        let mut idx = VecqIndex::new(dim, 21);
+        for i in 0..40u64 {
+            idx.add_keyed(10 * i, &rand_unit(dim, i + 61));
+        }
+        for i in 0..20u64 {
+            assert!(idx.remove_keyed(10 * i));
+        }
+        let q = rand_unit(dim, 123);
+        let expected = idx.search_keyed(&q, 20);
+        idx.compact();
+        assert_eq!(idx.tombstones(), 0);
+        assert_eq!(idx.len(), 20);
+        assert_eq!(idx.search_keyed(&q, 20), expected);
+        // Round-trip after compact: keys are not persisted by design, so the
+        // reloaded index is searchable positionally. f16 scales perturb
+        // scores by <1e-3, so compare order and approximate scores.
+        let bytes = idx.to_bytes();
+        let back = VecqIndex::from_bytes(&bytes).unwrap();
+        let reloaded = back.search(&q, 20);
+        assert_eq!(reloaded.len(), 20);
+        for ((slot, s), (key, ks)) in reloaded.iter().zip(expected.iter()) {
+            assert_eq!(idx.key_of(*slot), Some(*key));
+            assert!(
+                (s - ks).abs() < 1e-3,
+                "key {key} score drifted: {s} vs {ks}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyed_search_on_empty_and_drained_index() {
+        let dim = 32;
+        let mut idx = VecqIndex::new(dim, 31);
+        assert!(idx.search_keyed(&rand_unit(dim, 1), 3).is_empty());
+        idx.add_keyed(1, &rand_unit(dim, 2));
+        idx.add_keyed(2, &rand_unit(dim, 3));
+        assert!(idx.remove_keyed(1));
+        assert!(idx.remove_keyed(2));
+        assert!(idx.is_empty(), "drained index reports empty");
+        assert_eq!(idx.tombstones(), 2);
+        assert!(idx.search_keyed(&rand_unit(dim, 4), 3).is_empty());
+    }
+
+    #[test]
+    fn keyed_index_from_file_supports_keyed_adds() {
+        let dim = 64;
+        let mut idx = VecqIndex::new(dim, 41);
+        for i in 0..10u64 {
+            idx.add(&rand_unit(dim, i + 700));
+        }
+        let bytes = idx.to_bytes();
+        let mut back = VecqIndex::from_bytes(&bytes).unwrap();
+        back.add_keyed(555, &rand_unit(dim, 999));
+        assert!(back.contains_key(555));
+        assert_eq!(back.len(), 11);
+        let q = rand_unit(dim, 999);
+        assert_eq!(back.search_keyed(&q, 1)[0].0, 555);
+    }
+
+    #[test]
+    #[should_panic(expected = "vector dim mismatch")]
+    fn keyed_add_dim_mismatch_panics() {
+        let mut idx = VecqIndex::new(32, 3);
+        idx.add_keyed(1, &[0.5; 64]);
     }
 }

@@ -116,18 +116,34 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 
 impl VecqIndex {
     /// Serialize the index to bytes (format version 1.1, f16 scales).
+    ///
+    /// Tombstoned slots are skipped: the output always holds the live vectors
+    /// in slot order, so a round-trip through bytes has the same effect as
+    /// [`VecqIndex::compact`] on disk without disturbing in-memory slot
+    /// indices. Keys are not part of the file format; persist a key→slot
+    /// table alongside (e.g. in SQLite) if you need keyed access across a
+    /// reload.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(24 + self.codes.len() + self.scales.len() * 2);
+        let bpv = self.padded_dim() / 2;
+        let mut out = Vec::with_capacity(24 + self.live_slots() * bpv + self.live_slots() * 2);
         out.extend_from_slice(&MAGIC.to_le_bytes());
         out.extend_from_slice(&V1_1.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&(self.dim as u32).to_le_bytes());
-        out.extend_from_slice(&self.seed.to_le_bytes());
-        out.extend_from_slice(&(self.n as u32).to_le_bytes());
-        for s in &self.scales {
-            out.extend_from_slice(&f32_to_f16_bits(*s).to_le_bytes());
+        out.extend_from_slice(&(self.dim() as u32).to_le_bytes());
+        out.extend_from_slice(&self.seed().to_le_bytes());
+        out.extend_from_slice(&(self.len() as u32).to_le_bytes());
+        for slot in 0..self.slots() {
+            if !self.slot_alive(slot) {
+                continue;
+            }
+            out.extend_from_slice(&f32_to_f16_bits(self.slot_scale(slot)).to_le_bytes());
         }
-        out.extend_from_slice(&self.codes);
+        for slot in 0..self.slots() {
+            if !self.slot_alive(slot) {
+                continue;
+            }
+            out.extend_from_slice(self.slot_codes(slot, bpv));
+        }
         out
     }
 
@@ -172,6 +188,7 @@ impl VecqIndex {
         index.codes = bytes[off..off + count * codes_bytes].to_vec();
         index.scales = scales;
         index.n = count;
+        index.init_dense(count);
         Ok(index)
     }
 }
