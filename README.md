@@ -45,7 +45,9 @@ let hits: Vec<(usize, f32)> = index.search(&query, 10);
 
 // Keyed layer: stable u64 identity + removal for incremental workloads.
 index.add_keyed(1001, &doc_vec);
-index.remove_keyed(1001); // tombstone; `compact()` reclaims the slot
+index.add_keyed_multi(1001, &doc_vec_2);   // several vectors under one key
+index.relabel(1001, 2002);                 // rename a key in place
+index.remove_keyed(2002);                  // tombstone; `compact()` reclaims the slot
 let keyed_hits: Vec<(u64, f32)> = index.search_keyed(&query, 10);
 
 // Single-file persistence, deterministic across platforms.
