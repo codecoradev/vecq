@@ -60,6 +60,14 @@ impl VecqIndex {
             working_dim >= 1 && working_dim <= dim,
             "working_dim must be in 1..={dim}, got {working_dim}"
         );
+        // The file format stores a non-default working_dim in a u16 header
+        // field; anything wider would silently truncate on save (cora review
+        // caught exactly that wrap). working_dim == dim is stored as 0 and
+        // may be arbitrarily large.
+        assert!(
+            working_dim == dim || working_dim <= u16::MAX as usize,
+            "working_dim {working_dim} exceeds the u16 file-format range and does not equal dim"
+        );
         let padded = padded_dim(working_dim);
         Self {
             dim,
@@ -1334,5 +1342,29 @@ mod tests {
     #[should_panic(expected = "working_dim")]
     fn working_dim_zero_panics() {
         let _ = VecqIndex::with_working_dim(64, 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "u16")]
+    fn working_dim_beyond_u16_range_panics() {
+        // Regression: `working_dim as u16` in to_bytes silently wrapped for
+        // working_dim > 65535, producing files that parse with the wrong
+        // code layout. Only working_dim == dim may exceed u16::MAX (stored
+        // as 0 in the header).
+        let _ = VecqIndex::with_working_dim(100_000, 70_000, 1);
+    }
+
+    #[test]
+    fn full_dim_index_may_exceed_u16_dim() {
+        // working_dim == dim is stored as 0 in the header, so huge dims are
+        // representable.
+        let mut idx = VecqIndex::with_working_dim(70_000, 70_000, 1);
+        let mut v = vec![0f32; 70_000];
+        v[0] = 1.0;
+        idx.add(&v);
+        let q = vec![0f32; 70_000];
+        let mut q = q;
+        q[0] = 1.0;
+        assert_eq!(idx.search(&q, 1)[0].0, 0);
     }
 }
