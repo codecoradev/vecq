@@ -60,7 +60,22 @@ assert_eq!(index.search(&query, 10), back.search(&query, 10));
 - **Deterministic**: same file + same query → identical result bits on any platform. The seed lives in the header, the scoring path has a fixed association order and no FMA contraction, and a unit test enforces SIMD/scalar bit-identity.
 - **Zero dependencies** in `vecq-core`'s quantization path.
 - **Recall@10 ≥ 0.95** on real embedding data at 6x compression (see `docs/BENCHMARK.md`).
-- **Forward-compatible format**: readers accept v1 (f32 scales) and v1.1 (f16 scales) files.
+- **Forward-compatible format**: readers accept v1 (f32 scales), v1.1 (f16 scales) and v1.2 (Matryoshka working_dim) files.
+
+## Matryoshka models
+
+Embedding models trained Matryoshka-style (EmbeddingGemma, OpenAI `text-embedding-3-*`, …) degrade gracefully when truncated to their leading dimensions. Build an index over the leading `working_dim` dims to cut storage and scan cost roughly proportionally:
+
+```rust
+// 768-dim model, quantize only the leading 256 dims:
+let mut index = VecqIndex::with_working_dim(768, 256, 42);
+index.add(&embedding);          // always pass the full 768-dim vector
+let hits = index.search(&query, 10);
+
+// Truncation happens BEFORE normalization + rotation (RHDH mixes dims, so
+// post-rotation truncation would not be Matryoshka-equivalent). Scores are
+// comparable only with indexes sharing the same working_dim and seed.
+```
 
 ## Performance
 

@@ -62,6 +62,11 @@ contraction); a unit test enforces AVX2 == scalar and NEON == scalar on
 overlapping inputs. `search()` additionally batches 4 vectors per pass on
 both SIMD paths.
 
+> **Format note:** writers emit format v1.2 since the Matryoshka `working_dim`
+> feature (issue #24) — identical payload to v1.1 for full-dim indexes, with
+> the reserved header field carrying `working_dim` for truncated indexes.
+> Readers accept v1, v1.1 and v1.2.
+
 | architecture | path | selection |
 |---|---|---|
 | aarch64 (Apple Silicon, ARM servers) | explicit NEON (`vqtbl4q_u8` LUT gather), 4-vector batching | compile time (NEON is baseline) |

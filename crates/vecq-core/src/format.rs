@@ -10,16 +10,21 @@
 //!
 //! Version 1: scales stored as f32 (4 bytes each).
 //! Version 1.1 (stored as 257): scales stored as f16 (2 bytes each).
+//! Version 1.2 (stored as 258): the reserved u16 field carries the index's
+//! `working_dim` (Matryoshka truncation; 0 means working_dim == dim). Codes
+//! and scales are laid out exactly like 1.1 — only the semantic of the
+//! reserved field changes.
 //!
-//! Readers accept both; writers emit 1.1. The seed is stored in the header so
-//! the random sign diagonal can be regenerated identically on any platform:
-//! identical file -> identical query results, bit for bit.
+//! Readers accept v1, v1.1 and v1.2; writers emit 1.2. The seed is stored in
+//! the header so the random sign diagonal can be regenerated identically on
+//! any platform: identical file -> identical query results, bit for bit.
 
 use crate::store::VecqIndex;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"VECQ");
 const V1: u16 = 1;
 const V1_1: u16 = 257;
+pub const V1_2: u16 = 258;
 
 #[derive(Debug)]
 pub enum Error {
@@ -27,6 +32,7 @@ pub enum Error {
     UnsupportedVersion(u16),
     Truncated,
     DimMismatch { expected: usize, got: usize },
+    InvalidWorkingDim { dim: usize, working_dim: usize },
 }
 
 impl std::fmt::Display for Error {
@@ -37,6 +43,9 @@ impl std::fmt::Display for Error {
             Error::Truncated => write!(f, "file truncated"),
             Error::DimMismatch { expected, got } => {
                 write!(f, "dim mismatch: expected {expected}, got {got}")
+            }
+            Error::InvalidWorkingDim { dim, working_dim } => {
+                write!(f, "invalid working_dim {working_dim} for dim {dim}")
             }
         }
     }
@@ -115,7 +124,7 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 }
 
 impl VecqIndex {
-    /// Serialize the index to bytes (format version 1.1, f16 scales).
+    /// Serialize the index to bytes (format version 1.2, f16 scales).
     ///
     /// Tombstoned slots are skipped: the output always holds the live vectors
     /// in slot order, so a round-trip through bytes has the same effect as
@@ -125,10 +134,15 @@ impl VecqIndex {
     /// reload.
     pub fn to_bytes(&self) -> Vec<u8> {
         let bpv = self.padded_dim() / 2;
+        let reserved: u16 = if self.working_dim() == self.dim() {
+            0
+        } else {
+            self.working_dim() as u16
+        };
         let mut out = Vec::with_capacity(24 + self.live_slots() * bpv + self.live_slots() * 2);
         out.extend_from_slice(&MAGIC.to_le_bytes());
-        out.extend_from_slice(&V1_1.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&V1_2.to_le_bytes());
+        out.extend_from_slice(&reserved.to_le_bytes());
         out.extend_from_slice(&(self.dim() as u32).to_le_bytes());
         out.extend_from_slice(&self.seed().to_le_bytes());
         out.extend_from_slice(&(self.len() as u32).to_le_bytes());
@@ -147,7 +161,8 @@ impl VecqIndex {
         out
     }
 
-    /// Parse an index from bytes produced by [`to_bytes`] (or a v1 file).
+    /// Parse an index from bytes produced by [`to_bytes`] (a v1.2 file) or a
+    /// legacy v1 / v1.1 file.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let rd_u32 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
         let rd_u16 = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
@@ -158,14 +173,29 @@ impl VecqIndex {
             return Err(Error::NotAStableFile);
         }
         let version = rd_u16(&bytes[4..6]);
-        if version != V1 && version != V1_1 {
+        if version != V1 && version != V1_1 && version != V1_2 {
             return Err(Error::UnsupportedVersion(version));
         }
         let dim = rd_u32(&bytes[8..12]) as usize;
         let seed = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         let count = rd_u32(&bytes[20..24]) as usize;
 
-        let padded = crate::rhdh::padded_dim(dim);
+        // v1.2 carries working_dim in the reserved field (0 = full dim).
+        let working_dim = match version {
+            V1_2 => match rd_u16(&bytes[6..8]) as usize {
+                0 => dim,
+                w if w <= dim => w,
+                w => {
+                    return Err(Error::InvalidWorkingDim {
+                        dim,
+                        working_dim: w,
+                    })
+                }
+            },
+            _ => dim,
+        };
+
+        let padded = crate::rhdh::padded_dim(working_dim);
         let codes_bytes = padded / 2;
         let scale_bytes = if version == V1 { 4 } else { 2 };
         let expected = 24 + count * (scale_bytes + codes_bytes);
@@ -184,7 +214,7 @@ impl VecqIndex {
             scales.push(s);
             off += scale_bytes;
         }
-        let mut index = VecqIndex::new(dim, seed);
+        let mut index = VecqIndex::with_working_dim(dim, working_dim, seed);
         index.codes = bytes[off..off + count * codes_bytes].to_vec();
         index.scales = scales;
         index.n = count;
