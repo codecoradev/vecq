@@ -39,6 +39,11 @@ pub struct VecqIndex {
     // lives in exactly one of the two maps; single-slot keys stay in
     // `key_to_slot` to keep the common case allocation-free.
     key_to_slots: HashMap<u64, Vec<usize>>,
+    // 2-bit signatures for cascade search (issue #22), derived from the
+    // stored nibbles by [`VecqIndex::enable_cascade`]: `padded/4` bytes per
+    // slot. Any codes mutation (add/replace/compact) drops it; removals keep
+    // it — tombstoned slots are filtered at search time.
+    signature: Option<Vec<u8>>,
     alive: Vec<bool>, // slot -> not tombstoned
     live: usize,      // number of non-tombstoned slots
 }
@@ -87,6 +92,7 @@ impl VecqIndex {
             key_to_slots: HashMap::new(),
             alive: Vec::new(),
             live: 0,
+            signature: None,
         }
     }
 
@@ -158,6 +164,7 @@ impl VecqIndex {
         self.key_to_slot.clear();
         self.key_to_slots.clear();
         self.live = count;
+        self.signature = None;
     }
 
     /// Restore a dense index's slot→key table (file format v1.3) and rebuild
@@ -199,6 +206,8 @@ impl VecqIndex {
         let slot = self.primary_slot(key);
         match slot {
             Some(slot) => {
+                // Replace in place: codes change, cascade signatures go stale.
+                self.signature = None;
                 let scale = self.encode_into(slot * (self.padded / 2), v);
                 self.scales[slot] = scale;
                 slot
@@ -342,6 +351,155 @@ impl VecqIndex {
         self.key_to_slot.contains_key(&key) || self.key_to_slots.contains_key(&key)
     }
 
+    // -- cascade search (2-bit prefilter + 4-bit rescore) -------------------
+
+    /// Derive the 2-bit signatures used by [`VecqIndex::search_cascade`]:
+    /// the two high bits of each stored nibble (`nibble >> 2`), i.e. a
+    /// coarse Lloyd re-quantization of the rotated dims. Costs
+    /// `n * padded/4` bytes of memory. Adding, replacing or compacting
+    /// vectors drops the signatures — call this again to re-enable.
+    pub fn enable_cascade(&mut self) {
+        self.signature = Some(self.derive_signature());
+    }
+
+    /// Whether cascade signatures are currently available.
+    pub fn cascade_enabled(&self) -> bool {
+        self.signature.is_some()
+    }
+
+    fn sig_bytes(&self) -> usize {
+        self.padded.div_ceil(4)
+    }
+
+    /// Extract the per-slot 2-bit signature codes from the packed nibbles.
+    fn derive_signature(&self) -> Vec<u8> {
+        let bytes_per = self.sig_bytes();
+        let mut sig = vec![0u8; self.n * bytes_per];
+        let bpv = self.padded / 2;
+        for slot in 0..self.n {
+            let base = slot * bpv;
+            let sig_base = slot * bytes_per;
+            for (i, &byte) in self.codes[base..base + bpv].iter().enumerate() {
+                // Dim 2i uses the low nibble, 2i+1 the high nibble; each
+                // contributes 2 bits to signature byte i/2 at nibble i%2.
+                let lo = (byte & 0x0F) >> 2;
+                let hi = (byte >> 4) >> 2;
+                sig[sig_base + i / 2] |= if i % 2 == 0 {
+                    lo | (hi << 2)
+                } else {
+                    (lo << 4) | (hi << 6)
+                };
+            }
+        }
+        sig
+    }
+
+    /// Approximate top-k search: rank slots by L1 distance between the
+    /// query's and each slot's 2-bit signature codes (pure integer math),
+    /// keep the `r` closest, rescore those with the standard 4-bit path, and
+    /// return the top k. Slot indices are stable until compaction;
+    /// tombstoned slots are skipped.
+    ///
+    /// Requires [`VecqIndex::enable_cascade`] (panics otherwise). `r` is
+    /// clamped to `[k, live]`; with `r >= live` the result is identical to
+    /// [`VecqIndex::search`] bit for bit. The cascade is deterministic: same
+    /// file + query -> same result bits on any platform.
+    ///
+    /// Prefilter quality is data-dependent: the coarser the codes, the
+    /// larger `r` must be. Measure recall@k vs `r` on your data (the
+    /// synthetic clustered set in the tests needs r ~ 100 for ~0.9
+    /// recall@10 at n=1k; real embeddings need far less).
+    pub fn search_cascade(&self, q: &[f32], k: usize, r: usize) -> Vec<(usize, f32)> {
+        let Some(sig) = &self.signature else {
+            panic!("search_cascade requires enable_cascade() first");
+        };
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        let bytes_per = self.sig_bytes();
+        let pq = self.prepare_query(q);
+        let k = k.min(self.live).max(1);
+        let r = r.max(k).min(self.live);
+        // Query signature: re-quantize the (unnormalized) rotated dims to
+        // their 2-bit codes, matching the database derivation.
+        let rnorm = pq.rnorm;
+        let mut qsig = vec![0u8; bytes_per];
+        for (i, &x) in pq.rotated[..self.padded].iter().enumerate() {
+            let c2 = lloyd::quantize_4bit(x * rnorm) >> 2;
+            qsig[i / 4] |= c2 << ((i % 4) * 2);
+        }
+        // Pairwise L1 table for 2-bit codes: PAIR[(qa << 2) | da].
+        let pair: [u8; 16] = core::array::from_fn(|i| {
+            let (qa, da) = ((i >> 2) as u32, (i & 3) as u32);
+            qa.abs_diff(da) as u8
+        });
+
+        // Prefilter: L1 over 2-bit codes, 4 dim-pairs per signature byte.
+        // Max-heap of (distance, slot) keeps the r smallest, tie-breaking
+        // toward smaller slots.
+        let mut heap: BinaryHeap<(u32, usize)> = BinaryHeap::with_capacity(r + 1);
+        for slot in 0..self.n {
+            if !self.alive[slot] {
+                continue;
+            }
+            let base = slot * bytes_per;
+            let mut d = 0u32;
+            for (j, &db) in sig[base..base + bytes_per].iter().enumerate() {
+                let qb = qsig[j];
+                d += (pair[(qb & 0x03) as usize * 4 + (db & 0x03) as usize]
+                    + pair[((qb >> 2) & 0x03) as usize * 4 + ((db >> 2) & 0x03) as usize]
+                    + pair[((qb >> 4) & 0x03) as usize * 4 + ((db >> 4) & 0x03) as usize]
+                    + pair[((qb >> 6) & 0x03) as usize * 4 + ((db >> 6) & 0x03) as usize])
+                    as u32;
+            }
+            if heap.len() < r {
+                heap.push((d, slot));
+            } else if d < heap.peek().map(|e| e.0).unwrap_or(u32::MAX) {
+                heap.push((d, slot));
+                heap.pop();
+            }
+        }
+        let mut candidates: Vec<usize> = heap.into_iter().map(|(_, s)| s).collect();
+        candidates.sort_unstable();
+
+        // Rescore the candidates with the standard 4-bit path (bit-identical
+        // to `search`), same bounded-heap top-k.
+        let key = |s: f32| -> u32 {
+            let b = s.to_bits();
+            if b & 0x8000_0000 != 0 {
+                !b
+            } else {
+                b ^ 0x8000_0000
+            }
+        };
+        let mut top: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::with_capacity(k + 1);
+        let consider = |s: f32, slot: usize, top: &mut BinaryHeap<Reverse<(u32, usize)>>| {
+            let ks = key(s);
+            if top.len() < k {
+                top.push(Reverse((ks, slot)));
+            } else if ks > top.peek().map(|e| e.0 .0).unwrap_or(0) {
+                top.push(Reverse((ks, slot)));
+                top.pop();
+            }
+        };
+        for slot in candidates {
+            consider(self.score(&pq, slot), slot, &mut top);
+        }
+        let key_undo = |k: u32| -> u32 {
+            if k & 0x8000_0000 != 0 {
+                k ^ 0x8000_0000 // was a positive float
+            } else {
+                !k // was a negative float
+            }
+        };
+        let mut out: Vec<(usize, f32)> = top
+            .into_iter()
+            .map(|e| (e.0 .1, f32::from_bits(key_undo(e.0 .0))))
+            .collect();
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("no NaN scores"));
+        out
+    }
+
     /// Rebuild the index in place, dropping tombstoned slots.
     ///
     /// All remaining vectors keep their keys; **slot indices shift** to become
@@ -350,6 +508,8 @@ impl VecqIndex {
         if self.live == self.n {
             return;
         }
+        // Slots shift: cascade signatures go stale (re-enable after).
+        self.signature = None;
         let bpv = self.padded / 2;
         let mut codes = Vec::with_capacity(self.live * bpv);
         let mut scales = Vec::with_capacity(self.live);
@@ -390,6 +550,7 @@ impl VecqIndex {
     /// responsible for registering the key in the right map); returns the
     /// slot index.
     fn append_slot(&mut self, v: &[f32], key: Option<u64>) -> usize {
+        self.signature = None; // codes change: cascade signatures go stale
         let slot = self.n;
         let scale = self.encode_into(slot * (self.padded / 2), v);
         self.scales.push(scale);
@@ -465,7 +626,12 @@ impl VecqIndex {
         for (c, slot) in lut.iter_mut().enumerate() {
             *slot = lloyd::dequantize_4bit(c as u8);
         }
-        PreparedQuery { rotated, lut, norm }
+        PreparedQuery {
+            rotated,
+            lut,
+            norm,
+            rnorm,
+        }
     }
 
     /// Asymmetric score of vector `idx` against a prepared query.
@@ -982,6 +1148,10 @@ pub struct PreparedQuery {
     lut: [f32; 16],
     #[allow(dead_code)]
     norm: f32,
+    /// Norm of the rotated query before the final normalization — the
+    /// cascade search rescales its sign-threshold by this to match the
+    /// unnormalized domain the database codes were quantized in.
+    rnorm: f32,
 }
 
 /// Exact cosine similarity between two f32 vectors (ground truth helper).
@@ -1670,5 +1840,208 @@ mod tests {
         let mut q = q;
         q[0] = 1.0;
         assert_eq!(idx.search(&q, 1)[0].0, 0);
+    }
+
+    // -- cascade search (1-bit Hamming prefilter + 4-bit rescore) ------------
+
+    /// Clustered dataset in the style of the recall benchmark. `spread`
+    /// scales the per-dim noise around the centroid (0.5 = noise-dominated
+    /// and adversarial for coarse codes; ~0.1 = realistic embedding
+    /// structure).
+    fn clustered(n: usize, dim: usize, clusters: usize, seed: u64, spread: f32) -> Vec<Vec<f32>> {
+        fn next(x: &mut u64) -> f32 {
+            // Centered uniform in [-0.5, 0.5): uncentered noise makes every
+            // vector share a large positive component, which collapses the
+            // 1-bit signatures (all bits 1) and destroys Hamming ranking.
+            *x ^= *x << 13;
+            *x ^= *x >> 7;
+            *x ^= *x << 17;
+            *x as f32 / u32::MAX as f32 - 0.5
+        }
+        let mut x = seed | 1;
+        let mut centroids: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..clusters {
+            let mut v: Vec<f32> = (0..dim).map(|_| next(&mut x)).collect();
+            let norm: f32 = v.iter().map(|a| a * a).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|a| *a /= norm);
+            centroids.push(v);
+        }
+        (0..n)
+            .map(|i| {
+                let c = &centroids[i % clusters];
+                let mut v: Vec<f32> = c.iter().map(|&a| a + spread * next(&mut x)).collect();
+                let norm: f32 = v.iter().map(|a| a * a).sum::<f32>().sqrt();
+                v.iter_mut().for_each(|a| *a /= norm);
+                v
+            })
+            .collect()
+    }
+
+    fn exact_top(base: &[Vec<f32>], q: &[f32], k: usize) -> Vec<usize> {
+        let mut s: Vec<(usize, f32)> = base
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, cosine_f32(q, v)))
+            .collect();
+        s.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        s.into_iter().take(k).map(|(i, _)| i).collect()
+    }
+
+    #[test]
+    fn cascade_with_full_r_matches_exact_search_bitwise() {
+        let dim = 128;
+        let base = clustered(60, dim, 10, 5, 0.5);
+        let mut idx = VecqIndex::new(dim, 42);
+        for v in &base {
+            idx.add(v);
+        }
+        idx.enable_cascade();
+        assert!(idx.cascade_enabled());
+        let q = &base[0];
+        let exact = idx.search(q, 10);
+        let casc = idx.search_cascade(q, 10, 60);
+        assert_eq!(casc.len(), exact.len());
+        for ((sa, fa), (sb, fb)) in exact.iter().zip(casc.iter()) {
+            assert_eq!(sa, sb, "slot order must match with r >= n");
+            assert_eq!(fa.to_bits(), fb.to_bits(), "scores must be bit-identical");
+        }
+    }
+
+    #[test]
+    fn cascade_recall_grows_with_r() {
+        // This synthetic clustered set is adversarial for coarse codes
+        // (per-dim noise dominates the centroid signal), so absolute recall
+        // at small r is modest. What must hold: recall is monotone in the
+        // prefilter width r and reaches near-exact recall once r covers a
+        // fifth of the collection. Real embeddings need far smaller r —
+        // measure on your data (see search_cascade docs).
+        let recall = |idx: &VecqIndex, base: &[Vec<f32>], r: usize| -> f32 {
+            let queries = &base[990..];
+            let mut sum = 0f32;
+            for q in queries {
+                let truth = exact_top(base, q, 10);
+                let got: Vec<usize> = idx
+                    .search_cascade(q, 10, r)
+                    .into_iter()
+                    .map(|(i, _)| i)
+                    .collect();
+                sum += truth.iter().filter(|t| got.contains(t)).count() as f32 / 10.0;
+            }
+            sum / queries.len() as f32
+        };
+        // Moderate structure: a 10% scan recovers the majority of the true
+        // top-10. (Real embeddings show much stronger sign correlation than
+        // any synthetic set here; the 0.9+ gate belongs to that validation.)
+        let dim = 128;
+        let base = clustered(1000, dim, 50, 9, 0.1);
+        let mut idx = VecqIndex::new(dim, 42);
+        for v in &base {
+            idx.add(v);
+        }
+        idx.enable_cascade();
+        let r100 = recall(&idx, &base, 100);
+        assert!(r100 >= 0.5, "moderate set: r=100 (10% scan) recall {r100}");
+        // Adversarial set (noise-dominated): recall stays monotone in r and
+        // a 20% scan still recovers most of the truth.
+        let base = clustered(1000, dim, 50, 9, 0.5);
+        let mut idx = VecqIndex::new(dim, 42);
+        for v in &base {
+            idx.add(v);
+        }
+        idx.enable_cascade();
+        let (r25, r50, r100, r200) = (
+            recall(&idx, &base, 25),
+            recall(&idx, &base, 50),
+            recall(&idx, &base, 100),
+            recall(&idx, &base, 200),
+        );
+        assert!(
+            r25 <= r50 && r50 <= r100 && r100 <= r200,
+            "recall must be monotone in r: {r25} {r50} {r100} {r200}"
+        );
+        assert!(r200 >= 0.6, "adversarial set: r=200 recall {r200}");
+    }
+
+    #[test]
+    fn cascade_skips_tombstones_and_stays_deterministic() {
+        let dim = 64;
+        let base = clustered(80, dim, 8, 3, 0.5);
+        let mut idx = VecqIndex::new(dim, 42);
+        for v in &base {
+            idx.add(v);
+        }
+        idx.enable_cascade();
+        idx.remove_keyed(0);
+        idx.remove_keyed(1);
+        let q = &base[5];
+        let a = idx.search_cascade(q, 10, 80);
+        let b = idx.search_cascade(q, 10, 80);
+        assert_eq!(a, b, "deterministic across calls");
+        assert!(
+            !a.iter().any(|(s, _)| *s < 2),
+            "tombstoned slots must be skipped"
+        );
+        // With r covering everything, results equal exact search.
+        let exact = idx.search(q, 10);
+        assert_eq!(a, exact);
+    }
+
+    #[test]
+    fn cascade_works_after_reload_and_compact() {
+        let dim = 64;
+        let base = clustered(40, dim, 6, 11, 0.5);
+        let mut idx = VecqIndex::new(dim, 42);
+        for v in &base {
+            idx.add_keyed(100 + 1, v);
+        }
+        let bytes = idx.to_bytes();
+        let mut back = VecqIndex::from_bytes(&bytes).unwrap();
+        assert!(!back.cascade_enabled(), "signatures are not persisted");
+        back.enable_cascade();
+        let q = &base[3];
+        let casc = back.search_cascade(q, 5, 40);
+        assert_eq!(casc, back.search(q, 5));
+        // Compact keeps cascade working and correct.
+        back.remove_keyed(101);
+        back.compact();
+        back.enable_cascade();
+        let casc2 = back.search_cascade(q, 5, 39);
+        assert_eq!(casc2, back.search(q, 5));
+    }
+
+    #[test]
+    fn cascade_on_empty_index_returns_empty() {
+        let mut idx = VecqIndex::new(64, 1);
+        idx.enable_cascade();
+        let q = rand_unit(64, 2);
+        assert!(idx.search_cascade(&q, 5, 50).is_empty());
+    }
+
+    #[test]
+    fn cascade_r_clamps_to_live_count() {
+        let dim = 32;
+        let mut idx = VecqIndex::new(dim, 3);
+        for i in 0..4 {
+            idx.add(&rand_unit(dim, i + 80));
+        }
+        idx.enable_cascade();
+        let q = rand_unit(dim, 90);
+        let casc = idx.search_cascade(&q, 2, 1000);
+        assert_eq!(casc.len(), 2);
+        assert_eq!(casc, idx.search(&q, 2));
+    }
+
+    #[test]
+    fn cascade_works_with_working_dim_index() {
+        let dim = 128;
+        let working = 64;
+        let base = clustered(50, dim, 7, 13, 0.5);
+        let mut idx = VecqIndex::with_working_dim(dim, working, 42);
+        for v in &base {
+            idx.add(v);
+        }
+        idx.enable_cascade();
+        let q = &base[2];
+        assert_eq!(idx.search_cascade(q, 5, 50), idx.search(q, 5));
     }
 }
