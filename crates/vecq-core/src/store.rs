@@ -35,6 +35,10 @@ pub struct VecqIndex {
     pub(crate) n: usize,       // total slots in use (live + tombstoned)
     keys: Vec<Option<u64>>,    // slot -> caller key (keyed slots only)
     key_to_slot: HashMap<u64, usize>,
+    // Multi-key slots: keys carrying 2+ vectors (`add_keyed_multi`). A key
+    // lives in exactly one of the two maps; single-slot keys stay in
+    // `key_to_slot` to keep the common case allocation-free.
+    key_to_slots: HashMap<u64, Vec<usize>>,
     alive: Vec<bool>, // slot -> not tombstoned
     live: usize,      // number of non-tombstoned slots
 }
@@ -80,6 +84,7 @@ impl VecqIndex {
             n: 0,
             keys: Vec::new(),
             key_to_slot: HashMap::new(),
+            key_to_slots: HashMap::new(),
             alive: Vec::new(),
             live: 0,
         }
@@ -151,6 +156,7 @@ impl VecqIndex {
         self.keys = vec![None; count];
         self.alive = vec![true; count];
         self.key_to_slot.clear();
+        self.key_to_slots.clear();
         self.live = count;
     }
 
@@ -163,31 +169,144 @@ impl VecqIndex {
 
     /// Quantize and add one vector under a caller-chosen `u64` key.
     ///
-    /// If `key` already exists, the vector is replaced in place (the slot
-    /// index is preserved, matching usearch's insert semantics). Otherwise a
-    /// new slot is appended. Returns the slot index holding the vector.
+    /// If `key` already exists, the vector replaces the key's primary slot in
+    /// place (the slot index is preserved, matching usearch's insert
+    /// semantics). Otherwise a new slot is appended. Returns the slot index
+    /// holding the vector.
     pub fn add_keyed(&mut self, key: u64, v: &[f32]) -> usize {
-        if let Some(&slot) = self.key_to_slot.get(&key) {
-            let scale = self.encode_into(slot * (self.padded / 2), v);
-            self.scales[slot] = scale;
+        let slot = self.primary_slot(key);
+        match slot {
+            Some(slot) => {
+                let scale = self.encode_into(slot * (self.padded / 2), v);
+                self.scales[slot] = scale;
+                slot
+            }
+            None => {
+                let slot = self.append_slot(v, Some(key));
+                self.key_to_slot.insert(key, slot);
+                slot
+            }
+        }
+    }
+
+    /// Quantize and add one more vector under an existing (or new) key.
+    ///
+    /// Unlike [`VecqIndex::add_keyed`] this never replaces: the key accumulates
+    /// vectors (usearch's `multi` mode). Returns the new slot index.
+    /// [`VecqIndex::search_keyed`] reports each key once, scored by its best
+    /// slot; [`VecqIndex::remove_keyed`] removes all of a key's slots, while
+    /// [`VecqIndex::remove_keyed_at`] removes one.
+    pub fn add_keyed_multi(&mut self, key: u64, v: &[f32]) -> usize {
+        if let Some(&first) = self.key_to_slot.get(&key) {
+            // Promote the single-slot key to a multi-slot key.
+            self.key_to_slot.remove(&key);
+            let slot = self.append_slot(v, Some(key));
+            self.key_to_slots.insert(key, vec![first, slot]);
             return slot;
         }
-        self.append_slot(v, Some(key))
+        if self.key_to_slots.contains_key(&key) {
+            let slot = self.append_slot(v, Some(key));
+            self.key_to_slots
+                .get_mut(&key)
+                .expect("key checked above")
+                .push(slot);
+            return slot;
+        }
+        let slot = self.append_slot(v, Some(key));
+        self.key_to_slot.insert(key, slot);
+        slot
+    }
+
+    /// Rename `old_key` to `new_key` in place (slot indices untouched).
+    ///
+    /// Returns `false` if `old_key` is unknown or `new_key` is already taken;
+    /// renaming a key onto itself is a successful no-op.
+    pub fn relabel(&mut self, old_key: u64, new_key: u64) -> bool {
+        if old_key == new_key {
+            return self.contains_key(old_key);
+        }
+        if self.contains_key(new_key) {
+            return false;
+        }
+        if let Some(slot) = self.key_to_slot.remove(&old_key) {
+            self.key_to_slot.insert(new_key, slot);
+            self.keys[slot] = Some(new_key);
+            return true;
+        }
+        if let Some(slots) = self.key_to_slots.remove(&old_key) {
+            for &slot in &slots {
+                self.keys[slot] = Some(new_key);
+            }
+            self.key_to_slots.insert(new_key, slots);
+            return true;
+        }
+        false
     }
 
     /// Remove a keyed vector. The slot becomes a tombstone: its storage is
     /// kept (slot indices stay stable) but searches skip it until
-    /// [`VecqIndex::compact`]. Returns `false` if the key is unknown.
+    /// [`VecqIndex::compact`]. For multi-slot keys every slot of the key is
+    /// removed. Returns `false` if the key is unknown.
     pub fn remove_keyed(&mut self, key: u64) -> bool {
-        match self.key_to_slot.remove(&key) {
-            Some(slot) => {
+        if let Some(slot) = self.key_to_slot.remove(&key) {
+            self.alive[slot] = false;
+            self.keys[slot] = None;
+            self.live -= 1;
+            return true;
+        }
+        if let Some(slots) = self.key_to_slots.remove(&key) {
+            for slot in slots {
                 self.alive[slot] = false;
                 self.keys[slot] = None;
                 self.live -= 1;
-                true
             }
-            None => false,
+            return true;
         }
+        false
+    }
+
+    /// Remove one slot of a (possibly multi-slot) key.
+    ///
+    /// Returns `false` if the key is unknown or `slot` is not one of its live
+    /// slots. Removing a single-slot key's slot removes the key entirely; a
+    /// multi-slot key survives while at least one slot remains.
+    pub fn remove_keyed_at(&mut self, key: u64, slot: usize) -> bool {
+        if let Some(&primary) = self.key_to_slot.get(&key) {
+            if primary != slot {
+                return false;
+            }
+            return self.remove_keyed(key);
+        }
+        let Some(slots) = self.key_to_slots.get_mut(&key) else {
+            return false;
+        };
+        let Some(pos) = slots.iter().position(|&s| s == slot) else {
+            return false;
+        };
+        if !self.alive[slot] {
+            return false;
+        }
+        let dead = slots.swap_remove(pos);
+        self.alive[dead] = false;
+        self.keys[dead] = None;
+        self.live -= 1;
+        if slots.len() == 1 {
+            // Shrink back to the single-slot representation.
+            let last = slots[0];
+            self.key_to_slots.remove(&key);
+            self.key_to_slot.insert(key, last);
+        } else if slots.is_empty() {
+            self.key_to_slots.remove(&key);
+        }
+        true
+    }
+
+    /// Primary (first) live slot of `key`, if any.
+    fn primary_slot(&self, key: u64) -> Option<usize> {
+        self.key_to_slot
+            .get(&key)
+            .copied()
+            .or_else(|| self.key_to_slots.get(&key).and_then(|s| s.first().copied()))
     }
 
     /// Look up the key stored at `slot` (`None` for anonymous slots,
@@ -196,9 +315,9 @@ impl VecqIndex {
         self.keys.get(slot).copied().flatten()
     }
 
-    /// Whether `key` currently identifies a live vector.
+    /// Whether `key` currently identifies at least one live vector.
     pub fn contains_key(&self, key: u64) -> bool {
-        self.key_to_slot.contains_key(&key)
+        self.key_to_slot.contains_key(&key) || self.key_to_slots.contains_key(&key)
     }
 
     /// Rebuild the index in place, dropping tombstoned slots.
@@ -212,36 +331,47 @@ impl VecqIndex {
         let bpv = self.padded / 2;
         let mut codes = Vec::with_capacity(self.live * bpv);
         let mut scales = Vec::with_capacity(self.live);
-        let mut keys = Vec::with_capacity(self.live);
         let mut alive = Vec::with_capacity(self.live);
-        self.key_to_slot.clear();
+        let mut new_keys: Vec<Option<u64>> = Vec::with_capacity(self.live);
         for slot in 0..self.n {
             if self.alive[slot] {
                 codes.extend_from_slice(&self.codes[slot * bpv..(slot + 1) * bpv]);
                 scales.push(self.scales[slot]);
-                if let Some(key) = self.keys[slot] {
-                    self.key_to_slot.insert(key, keys.len());
-                }
-                keys.push(self.keys[slot]);
+                new_keys.push(self.keys[slot]);
                 alive.push(true);
+            }
+        }
+        self.key_to_slot.clear();
+        self.key_to_slots.clear();
+        for (new_slot, key) in new_keys.iter().enumerate() {
+            if let Some(key) = key {
+                if let Some(slots) = self.key_to_slots.get_mut(key) {
+                    // Third and later slots of a multi key.
+                    slots.push(new_slot);
+                } else if let Some(first) = self.key_to_slot.remove(key) {
+                    // Second slot: promote to the multi-slot map.
+                    self.key_to_slots.insert(*key, vec![first, new_slot]);
+                } else {
+                    self.key_to_slot.insert(*key, new_slot);
+                }
             }
         }
         self.codes = codes;
         self.scales = scales;
-        self.keys = keys;
+        self.keys = new_keys;
         self.alive = alive;
         self.n = self.live;
     }
 
     /// Append one vector as a new slot; returns the slot index.
+    /// Append one vector as a new slot and stamp `key` on it (the caller is
+    /// responsible for registering the key in the right map); returns the
+    /// slot index.
     fn append_slot(&mut self, v: &[f32], key: Option<u64>) -> usize {
         let slot = self.n;
         let scale = self.encode_into(slot * (self.padded / 2), v);
         self.scales.push(scale);
         self.keys.push(key);
-        if let Some(key) = key {
-            self.key_to_slot.insert(key, slot);
-        }
         self.alive.push(true);
         self.n += 1;
         self.live += 1;
@@ -364,11 +494,15 @@ impl VecqIndex {
     }
 
     /// Keyed variant of [`VecqIndex::search`]: returns (key, score) sorted by
-    /// score desc, restricted to live keyed vectors.
+    /// score desc, restricted to live keyed vectors. Multi-slot keys appear
+    /// once, scored by their best slot — so the result can hold fewer than
+    /// `k` entries when keys occupy several of the top slots.
     pub fn search_keyed(&self, q: &[f32], k: usize) -> Vec<(u64, f32)> {
+        let mut seen = std::collections::HashSet::new();
         self.search_slots(q, k)
             .into_iter()
             .filter_map(|(slot, s)| self.key_of(slot).map(|key| (key, s)))
+            .filter(|(key, _)| seen.insert(*key))
             .collect()
     }
 
@@ -1216,6 +1350,102 @@ mod tests {
     fn keyed_add_dim_mismatch_panics() {
         let mut idx = VecqIndex::new(32, 3);
         idx.add_keyed(1, &[0.5; 64]);
+    }
+
+    // -- keyed parity: relabel + multi-vectors-per-key -----------------------
+
+    #[test]
+    fn relabel_moves_key_and_rejects_conflicts() {
+        let dim = 32;
+        let mut idx = VecqIndex::new(dim, 5);
+        idx.add_keyed(1, &rand_unit(dim, 11));
+        assert!(idx.relabel(1, 2), "relabel to a free key succeeds");
+        assert!(!idx.contains_key(1));
+        assert!(idx.contains_key(2));
+        // The vector moved with the key.
+        let q = rand_unit(dim, 11);
+        assert_eq!(idx.search_keyed(&q, 1)[0].0, 2);
+        // Unknown source key fails.
+        assert!(!idx.relabel(1, 3));
+        // Taken target key fails.
+        idx.add_keyed(3, &rand_unit(dim, 22));
+        assert!(!idx.relabel(3, 2));
+        // Relabeling onto itself is a no-op success.
+        assert!(idx.relabel(2, 2));
+        assert!(idx.contains_key(2));
+    }
+
+    #[test]
+    fn multi_key_add_search_and_dedupe() {
+        let dim = 32;
+        let mut idx = VecqIndex::new(dim, 9);
+        let v1 = rand_unit(dim, 101);
+        let v2 = rand_unit(dim, 202);
+        idx.add_keyed(7, &v1);
+        idx.add_keyed_multi(7, &v2);
+        assert_eq!(idx.len(), 2, "multi add appends a slot");
+        assert_eq!(idx.tombstones(), 0);
+        // search_keyed returns the key once, with its best slot's score.
+        let q_v2 = v2.clone();
+        let hits = idx.search_keyed(&q_v2, 5);
+        assert_eq!(hits.len(), 1, "key must be deduped across its slots");
+        assert_eq!(hits[0].0, 7);
+        let q_v1 = v1.clone();
+        assert_eq!(idx.search_keyed(&q_v1, 5)[0].0, 7);
+        // Adding a second key: top hit is the closer key, still deduped.
+        idx.add_keyed(8, &rand_unit(dim, 303));
+        let hits = idx.search_keyed(&q_v2, 5);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0, 7);
+    }
+
+    #[test]
+    fn multi_key_remove_and_remove_at() {
+        let dim = 32;
+        let mut idx = VecqIndex::new(dim, 13);
+        idx.add_keyed(7, &rand_unit(dim, 101));
+        idx.add_keyed_multi(7, &rand_unit(dim, 202));
+        // remove_keyed drops every slot of the key.
+        assert!(idx.remove_keyed(7));
+        assert_eq!(idx.len(), 0);
+        assert_eq!(idx.tombstones(), 2);
+        assert!(!idx.contains_key(7));
+        assert!(!idx.remove_keyed(7));
+        // remove_keyed_at drops one slot; the key survives while slots remain.
+        let mut idx2 = VecqIndex::new(dim, 17);
+        idx2.add_keyed(9, &rand_unit(dim, 111));
+        let slot0 = idx2.add_keyed_multi(9, &rand_unit(dim, 222));
+        let slot1 = idx2.add_keyed_multi(9, &rand_unit(dim, 333));
+        assert!(idx2.remove_keyed_at(9, slot0));
+        assert!(idx2.contains_key(9));
+        assert!(idx2.remove_keyed_at(9, slot1));
+        assert!(idx2.contains_key(9), "primary slot keeps the key alive");
+        assert!(!idx2.remove_keyed_at(9, slot0), "already-dead slot");
+        assert_eq!(idx2.len(), 1);
+    }
+
+    #[test]
+    fn multi_key_replace_and_relabel_and_compact() {
+        let dim = 32;
+        let mut idx = VecqIndex::new(dim, 21);
+        idx.add_keyed(7, &rand_unit(dim, 101));
+        idx.add_keyed_multi(7, &rand_unit(dim, 202));
+        // add_keyed on an existing multi key replaces its primary slot.
+        let v3 = rand_unit(dim, 404);
+        let replaced = idx.add_keyed(7, &v3);
+        assert_eq!(idx.len(), 2, "replace must not grow the index");
+        let hits = idx.search_keyed(&v3, 5);
+        assert_eq!(hits[0].0, 7);
+        let _ = replaced;
+        // Relabel a multi key.
+        assert!(idx.relabel(7, 8));
+        assert_eq!(idx.search_keyed(&v3, 5)[0].0, 8);
+        // Compact preserves the multi mapping and deduped search.
+        let q = v3.clone();
+        let expected = idx.search_keyed(&q, 5);
+        idx.compact();
+        assert_eq!(idx.tombstones(), 0);
+        assert_eq!(idx.search_keyed(&q, 5), expected);
     }
 
     // -- Matryoshka working_dim ----------------------------------------------
