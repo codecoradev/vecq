@@ -21,6 +21,12 @@ use std::collections::HashMap;
 /// keys are the durable identity.
 pub struct VecqIndex {
     pub(crate) dim: usize,
+    /// Dimensions actually used: vectors and queries are truncated to the
+    /// leading `working_dim` coords *before* normalization and rotation
+    /// (Matryoshka-style truncation must happen pre-rotation, because RHDH
+    /// mixes dimensions). Equal to `dim` unless built via
+    /// [`VecqIndex::with_working_dim`].
+    working_dim: usize,
     padded: usize,
     pub(crate) seed: u64,
     transform: Rhdh,
@@ -37,12 +43,38 @@ impl VecqIndex {
     /// Create an empty index for `dim`-dimensional unit vectors.
     /// `seed` must be persisted with the index for cross-platform determinism.
     pub fn new(dim: usize, seed: u64) -> Self {
-        let padded = padded_dim(dim);
+        Self::with_working_dim(dim, dim, seed)
+    }
+
+    /// Create an empty index over the leading `working_dim` dimensions of
+    /// `dim`-dimensional vectors (Matryoshka truncation).
+    ///
+    /// Vectors and queries are always passed at full `dim` length; the index
+    /// truncates them to `working_dim` *before* normalization and the RHDH
+    /// rotation (truncating after rotation would not be equivalent, since the
+    /// transform mixes dimensions). Scores are computed in the
+    /// `working_dim`-dimensional space and are only comparable with indexes
+    /// built with the same `working_dim` and `seed`.
+    pub fn with_working_dim(dim: usize, working_dim: usize, seed: u64) -> Self {
+        assert!(
+            working_dim >= 1 && working_dim <= dim,
+            "working_dim must be in 1..={dim}, got {working_dim}"
+        );
+        // The file format stores a non-default working_dim in a u16 header
+        // field; anything wider would silently truncate on save (cora review
+        // caught exactly that wrap). working_dim == dim is stored as 0 and
+        // may be arbitrarily large.
+        assert!(
+            working_dim == dim || working_dim <= u16::MAX as usize,
+            "working_dim {working_dim} exceeds the u16 file-format range and does not equal dim"
+        );
+        let padded = padded_dim(working_dim);
         Self {
             dim,
+            working_dim,
             padded,
             seed,
-            transform: Rhdh::new(dim, seed),
+            transform: Rhdh::new(working_dim, seed),
             codes: Vec::new(),
             scales: Vec::new(),
             n: 0,
@@ -75,6 +107,11 @@ impl VecqIndex {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// Dimensions actually quantized (see [`VecqIndex::with_working_dim`]).
+    pub fn working_dim(&self) -> usize {
+        self.working_dim
     }
 
     pub fn seed(&self) -> u64 {
@@ -215,9 +252,15 @@ impl VecqIndex {
     /// `codes` when appending); returns the unit-norm correction scale.
     fn encode_into(&mut self, base: usize, v: &[f32]) -> f32 {
         assert_eq!(v.len(), self.dim, "vector dim mismatch");
-        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // Normalize over the working dims only (Matryoshka truncation happens
+        // before rotation — see with_working_dim).
+        let norm: f32 = v[..self.working_dim]
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
         assert!(norm > 0.0, "zero vector");
-        let unit: Vec<f32> = v.iter().map(|x| x / norm).collect();
+        let unit: Vec<f32> = v[..self.working_dim].iter().map(|x| x / norm).collect();
 
         let mut rotated = Vec::with_capacity(self.padded);
         self.transform.apply(&unit, &mut rotated);
@@ -248,8 +291,14 @@ impl VecqIndex {
     /// Prepare an f32 query in rotated space (call once per query).
     pub fn prepare_query(&self, q: &[f32]) -> PreparedQuery {
         assert_eq!(q.len(), self.dim);
-        let norm: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let unit: Vec<f32> = q.iter().map(|x| x / norm).collect();
+        // Truncate + normalize over the working dims, mirroring encode_into.
+        let norm: f32 = q[..self.working_dim]
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
+        assert!(norm > 0.0, "zero vector");
+        let unit: Vec<f32> = q[..self.working_dim].iter().map(|x| x / norm).collect();
         let mut rotated = Vec::with_capacity(self.padded);
         self.transform.apply(&unit, &mut rotated);
         // Normalize so ||rotated|| == 1 despite the unnormalized FWHT
@@ -1167,5 +1216,155 @@ mod tests {
     fn keyed_add_dim_mismatch_panics() {
         let mut idx = VecqIndex::new(32, 3);
         idx.add_keyed(1, &[0.5; 64]);
+    }
+
+    // -- Matryoshka working_dim ----------------------------------------------
+
+    #[test]
+    fn working_dim_equal_to_dim_matches_new_bitwise() {
+        let dim = 128;
+        let mut a = VecqIndex::new(dim, 7);
+        let mut b = VecqIndex::with_working_dim(dim, dim, 7);
+        for i in 0..20 {
+            a.add(&rand_unit(dim, i + 61));
+            b.add(&rand_unit(dim, i + 61));
+        }
+        let q = rand_unit(dim, 321);
+        let ra = a.search(&q, 5);
+        let rb = b.search(&q, 5);
+        assert_eq!(ra.len(), rb.len());
+        for ((sa, fa), (sb, fb)) in ra.iter().zip(rb.iter()) {
+            assert_eq!(sa, sb);
+            assert_eq!(fa.to_bits(), fb.to_bits());
+        }
+        assert_eq!(a.to_bytes(), b.to_bytes());
+        assert_eq!(b.working_dim(), dim);
+    }
+
+    #[test]
+    fn working_dim_truncates_storage_and_keeps_leading_signal() {
+        // Matryoshka-style synthetic: signal lives in the leading dims, the
+        // tail is noise. A working_dim index over the leading dims must keep
+        // the neighbor ranking (truncation is the Matryoshka contract) at a
+        // fraction of the storage.
+        let (dim, working, n) = (256, 64, 40);
+        let signal: Vec<Vec<f32>> = (0..n).map(|i| rand_unit(working, i * 13 + 5)).collect();
+        let mut full = VecqIndex::new(dim, 11);
+        let mut trunc = VecqIndex::with_working_dim(dim, working, 11);
+        for (i, s) in signal.iter().enumerate() {
+            // leading dims carry the identity, tail is per-vector noise
+            let mut v = vec![0f32; dim];
+            v[..working].copy_from_slice(s);
+            let noise = rand_unit(dim - working, 9_000 + i as u64);
+            v[working..].copy_from_slice(&noise.iter().map(|x: &f32| x * 0.05).collect::<Vec<_>>());
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+            full.add(&v);
+            trunc.add(&v);
+        }
+        assert_eq!(trunc.working_dim(), working);
+        // Storage: padded(64)/2 + 2 = 34 B/vec vs padded(256)/2 + 2 = 130.
+        assert!(
+            trunc.to_bytes().len() * 3 < full.to_bytes().len(),
+            "expected ~3x smaller"
+        );
+        // Query: same construction as the true neighbor of vector 0.
+        let q = &signal[0];
+        let mut qv = vec![0f32; dim];
+        qv[..working].copy_from_slice(q);
+        let noise = rand_unit(dim - working, 9_000);
+        qv[working..].copy_from_slice(&noise.iter().map(|x: &f32| x * 0.05).collect::<Vec<_>>());
+        let norm: f32 = qv.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in qv.iter_mut() {
+            *x /= norm;
+        }
+        let rt = trunc.search(&qv, 1);
+        assert_eq!(rt[0].0, 0, "truncated index must rank vector 0 first");
+    }
+
+    #[test]
+    fn working_dim_round_trips_through_file() {
+        let (dim, working) = (256, 64);
+        let mut idx = VecqIndex::with_working_dim(dim, working, 21);
+        for i in 0..10 {
+            idx.add(&rand_unit(dim, i + 700));
+        }
+        let q = rand_unit(dim, 999);
+        let expected = idx.search(&q, 5);
+        let bytes = idx.to_bytes();
+        let back = VecqIndex::from_bytes(&bytes).expect("parse v1.2");
+        assert_eq!(back.working_dim(), working);
+        assert_eq!(back.dim(), dim);
+        // f16 scales perturb scores by <1e-3: compare top-1 exactly, then
+        // overlap and approximate scores (mirrors the v1.1 round-trip test).
+        let reloaded = back.search(&q, 5);
+        assert_eq!(reloaded[0].0, expected[0].0);
+        assert_eq!(reloaded.len(), expected.len());
+        for ((s0, f0), (_, f1)) in reloaded.iter().zip(expected.iter()) {
+            assert!((f0 - f1).abs() < 1e-3, "slot {s0}: {f0} vs {f1}");
+        }
+    }
+
+    #[test]
+    fn legacy_v11_file_still_loads() {
+        // A v1.1 file (reserved = 0) written before working_dim existed must
+        // load as a full-dim index. v1.1 and v1.2 payloads are identical when
+        // working_dim == dim (only the version field differs), so both loads
+        // must agree bit for bit.
+        let mut idx = VecqIndex::new(128, 33);
+        for i in 0..8 {
+            idx.add(&rand_unit(128, i + 50));
+        }
+        let bytes = idx.to_bytes(); // v1.2 now
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            crate::format::V1_2
+        );
+        let mut v11 = bytes.clone();
+        v11[4] = 257u16.to_le_bytes()[0];
+        v11[5] = 257u16.to_le_bytes()[1];
+        let q = rand_unit(128, 777);
+        assert_eq!(
+            VecqIndex::from_bytes(&v11).unwrap().search(&q, 5),
+            VecqIndex::from_bytes(&bytes).unwrap().search(&q, 5)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "working_dim")]
+    fn working_dim_greater_than_dim_panics() {
+        let _ = VecqIndex::with_working_dim(64, 128, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "working_dim")]
+    fn working_dim_zero_panics() {
+        let _ = VecqIndex::with_working_dim(64, 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "u16")]
+    fn working_dim_beyond_u16_range_panics() {
+        // Regression: `working_dim as u16` in to_bytes silently wrapped for
+        // working_dim > 65535, producing files that parse with the wrong
+        // code layout. Only working_dim == dim may exceed u16::MAX (stored
+        // as 0 in the header).
+        let _ = VecqIndex::with_working_dim(100_000, 70_000, 1);
+    }
+
+    #[test]
+    fn full_dim_index_may_exceed_u16_dim() {
+        // working_dim == dim is stored as 0 in the header, so huge dims are
+        // representable.
+        let mut idx = VecqIndex::with_working_dim(70_000, 70_000, 1);
+        let mut v = vec![0f32; 70_000];
+        v[0] = 1.0;
+        idx.add(&v);
+        let q = vec![0f32; 70_000];
+        let mut q = q;
+        q[0] = 1.0;
+        assert_eq!(idx.search(&q, 1)[0].0, 0);
     }
 }
