@@ -43,7 +43,13 @@ for v in &vectors { index.add(v); }
 
 let hits: Vec<(usize, f32)> = index.search(&query, 10);
 
+// Keyed layer: stable u64 identity + removal for incremental workloads.
+index.add_keyed(1001, &doc_vec);
+index.remove_keyed(1001); // tombstone; `compact()` reclaims the slot
+let keyed_hits: Vec<(u64, f32)> = index.search_keyed(&query, 10);
+
 // Single-file persistence, deterministic across platforms.
+// Tombstones are dropped on disk; keys live in your own metadata table.
 let bytes = index.to_bytes();
 let back = VecqIndex::from_bytes(&bytes).unwrap();
 assert_eq!(index.search(&query, 10), back.search(&query, 10));
