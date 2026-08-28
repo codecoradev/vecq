@@ -736,7 +736,7 @@ mod avx2 {
         while i + 8 <= nb {
             // Shared q loads + deinterleave for this block.
             let (even, odd) = deinterleave16(q.as_ptr().add(i * 2));
-            for v in 0..4 {
+            for (v, acc_v) in acc.iter_mut().enumerate() {
                 let b8 = _mm_loadl_epi64(codes4.as_ptr().add(v * nb + i) as *const __m128i);
                 let g_lo = gather8(lut, _mm_and_si128(b8, _mm_set1_epi8(0x0F)));
                 let g_hi = gather8(
@@ -744,7 +744,7 @@ mod avx2 {
                     _mm_and_si128(_mm_srli_epi16(b8, 4), _mm_set1_epi8(0x0F)),
                 );
                 let term = _mm256_add_ps(_mm256_mul_ps(even, g_lo), _mm256_mul_ps(odd, g_hi));
-                acc[v] = _mm256_add_ps(acc[v], term);
+                *acc_v = _mm256_add_ps(*acc_v, term);
             }
             i += 8;
         }
