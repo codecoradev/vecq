@@ -55,12 +55,34 @@ Recall@1 = 0.910. Recall gate for the spike was **≥ 0.95** → **passed**.
 - f16 scales perturb scores by <1e-3; ranking ties near the cutoff can shift
   by one position (covered by tests: top-10 overlap ≥ 9/10, top-1 unchanged).
 
+## Scoring paths per architecture
+
+All paths produce **bit-identical scores** (same association order, no FMA
+contraction); a unit test enforces AVX2 == scalar and NEON == scalar on
+overlapping inputs. `search()` additionally batches 4 vectors per pass on
+both SIMD paths.
+
+| architecture | path | selection |
+|---|---|---|
+| aarch64 (Apple Silicon, ARM servers) | explicit NEON (`vqtbl4q_u8` LUT gather), 4-vector batching | compile time (NEON is baseline) |
+| x86_64 with AVX2 | explicit AVX2 (`vgatherdps` LUT gather), 4-vector batching | runtime (`is_x86_feature_detected!`) |
+| x86_64 without AVX2 | portable scalar (reference association order) | runtime fallback |
+| other targets | portable scalar | compile time |
+
+The measured table above is aarch64 (NEON path). x86_64 AVX2 numbers are
+pending measurement on native hardware; the expected gain over the scalar
+path is roughly 1.5–2.5x on LUT-heavy scoring workloads (gather throughput
+bound). Rosetta-emulated runs are explicitly **not** used as x86_64
+benchmarks — Rosetta neither advertises AVX2 via CPUID nor reflects native
+throughput.
+
 ## Conclusion
 
 The spike validates the technique: training-free 4-bit RHDH + Lloyd-Max
 quantization with asymmetric scoring keeps Recall@10 above 0.95 at ~6x
 compression on real Gemma embeddings. Recommended next steps:
 
-1. Explicit NEON nibble decode (target ≤ 0.8 ms/q at n=2k)
+1. ~~Explicit NEON nibble decode (target ≤ 0.8 ms/q at n=2k)~~ — done
+   (explicit NEON + AVX2 nibble-gather paths with bit-identity tests)
 2. Optional rerank: return top-50, rescore exact f32 on a sidecar — recall ≈ 1.0
-3. Top-k selection without full sort (bounded binary heap)
+3. Top-k selection without full sort (bounded binary heap) — done

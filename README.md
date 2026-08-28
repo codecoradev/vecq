@@ -43,7 +43,13 @@ for v in &vectors { index.add(v); }
 
 let hits: Vec<(usize, f32)> = index.search(&query, 10);
 
+// Keyed layer: stable u64 identity + removal for incremental workloads.
+index.add_keyed(1001, &doc_vec);
+index.remove_keyed(1001); // tombstone; `compact()` reclaims the slot
+let keyed_hits: Vec<(u64, f32)> = index.search_keyed(&query, 10);
+
 // Single-file persistence, deterministic across platforms.
+// Tombstones are dropped on disk; keys live in your own metadata table.
 let bytes = index.to_bytes();
 let back = VecqIndex::from_bytes(&bytes).unwrap();
 assert_eq!(index.search(&query, 10), back.search(&query, 10));
@@ -58,7 +64,11 @@ assert_eq!(index.search(&query, 10), back.search(&query, 10));
 
 ## Performance
 
-Measured on aarch64, single-threaded, 2,000 real EmbeddingGemma vectors (768-dim): search **0.89 ms/query**, build **64 ms**, recall@10 **0.958**. Full methodology and comparison against usearch in [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
+Measured on aarch64, single-threaded, 2,000 real EmbeddingGemma vectors (768-dim): search **0.89 ms/query**, build **64 ms**, recall@10 **0.958**. Full methodology, comparison against usearch, and the per-architecture scoring-path matrix (NEON / AVX2 / scalar, all bit-identical) in [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
+
+## SQLite integration
+
+Storing the index inside your SQLite database as a BLOB (schema, save/load pattern, atomicity, measured latencies at 1k/10k/50k vectors, and pitfalls): [`docs/SQLITE.md`](docs/SQLITE.md).
 
 ## Used by
 
