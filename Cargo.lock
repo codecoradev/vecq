@@ -347,7 +347,11 @@ dependencies = [
 
 [[package]]
 name = "vecq-bench"
+<<<<<<< HEAD
 version = "0.2.0"
+=======
+version = "0.1.1"
+>>>>>>> origin/main
 dependencies = [
  "usearch",
  "vecq-core",
@@ -355,7 +359,11 @@ dependencies = [
 
 [[package]]
 name = "vecq-core"
+<<<<<<< HEAD
 version = "0.2.0"
+=======
+version = "0.1.1"
+>>>>>>> origin/main
 dependencies = [
  "rand",
 ]
