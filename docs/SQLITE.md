@@ -42,20 +42,13 @@ CREATE TABLE vecq_shard (
 );
 ```
 
-Keys from the keyed API (`add_keyed`/`remove_keyed`) are **not** part of the
-file format — persist your own mapping table next to the index:
-
-```sql
-CREATE TABLE vecq_keys (
-    key  INTEGER PRIMARY KEY,       -- the u64 key used in add_keyed()
-    slot INTEGER NOT NULL           -- slot index, valid until compact()
-);
-```
-
-Because `to_bytes()` drops tombstones and re-serializes live slots in order,
-**slot indices change whenever you save-then-reload after a `compact()`** —
-rewrite `vecq_keys` in the same transaction whenever you save the index (see
-below), or simply resolve keys → search results instead of storing slots.
+Keys from the keyed API (`add_keyed`/`remove_keyed`) are **part of the file
+format since v1.3**: `to_bytes()` stores them and `from_bytes()` restores the
+keyed map, so a save/reload round-trip keeps `search_keyed`/`remove_keyed`
+working. Slot indices change whenever you save-then-reload after a
+`compact()` (the file always stores live slots densely) — rewrite
+`vecq_keys` in the same transaction whenever you save the index, or simply
+resolve keys → search results instead of storing slots.
 
 ## Canonical save/load (Rust + rusqlite)
 

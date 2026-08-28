@@ -51,7 +51,7 @@ index.remove_keyed(2002);                  // tombstone; `compact()` reclaims th
 let keyed_hits: Vec<(u64, f32)> = index.search_keyed(&query, 10);
 
 // Single-file persistence, deterministic across platforms.
-// Tombstones are dropped on disk; keys live in your own metadata table.
+// Tombstones are dropped on disk; keys persist (format v1.3 keyed table).
 let bytes = index.to_bytes();
 let back = VecqIndex::from_bytes(&bytes).unwrap();
 assert_eq!(index.search(&query, 10), back.search(&query, 10));
@@ -62,7 +62,7 @@ assert_eq!(index.search(&query, 10), back.search(&query, 10));
 - **Deterministic**: same file + same query → identical result bits on any platform. The seed lives in the header, the scoring path has a fixed association order and no FMA contraction, and a unit test enforces SIMD/scalar bit-identity.
 - **Zero dependencies** in `vecq-core`'s quantization path.
 - **Recall@10 ≥ 0.95** on real embedding data at 6x compression (see `docs/BENCHMARK.md`).
-- **Forward-compatible format**: readers accept v1 (f32 scales), v1.1 (f16 scales) and v1.2 (Matryoshka working_dim) files.
+- **Forward-compatible format**: readers accept v1 (f32 scales), v1.1 (f16 scales), v1.2 (Matryoshka working_dim) and v1.3 (keyed-slot table) files.
 
 ## Matryoshka models
 

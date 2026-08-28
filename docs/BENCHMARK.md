@@ -62,10 +62,10 @@ contraction); a unit test enforces AVX2 == scalar and NEON == scalar on
 overlapping inputs. `search()` additionally batches 4 vectors per pass on
 both SIMD paths.
 
-> **Format note:** writers emit format v1.2 since the Matryoshka `working_dim`
-> feature (issue #24) — identical payload to v1.1 for full-dim indexes, with
-> the reserved header field carrying `working_dim` for truncated indexes.
-> Readers accept v1, v1.1 and v1.2.
+> **Format note:** writers emit format v1.3 — v1.2 added the Matryoshka
+> `working_dim` header field (issue #24), v1.3 appends a keyed-slot table so
+> keyed APIs survive save/reload (issue #32). Readers accept v1, v1.1, v1.2
+> and v1.3.
 
 | architecture | path | selection |
 |---|---|---|

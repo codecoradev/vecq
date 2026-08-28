@@ -160,6 +160,28 @@ impl VecqIndex {
         self.live = count;
     }
 
+    /// Restore a dense index's slot→key table (file format v1.3) and rebuild
+    /// the key maps from it.
+    pub(crate) fn restore_keys(&mut self, table: Vec<Option<u64>>) {
+        let count = table.len();
+        self.keys = table;
+        self.alive = vec![true; count];
+        self.live = count;
+        self.key_to_slot.clear();
+        self.key_to_slots.clear();
+        for (slot, key) in self.keys.iter().enumerate() {
+            if let Some(key) = *key {
+                if let Some(slots) = self.key_to_slots.get_mut(&key) {
+                    slots.push(slot);
+                } else if let Some(first) = self.key_to_slot.remove(&key) {
+                    self.key_to_slots.insert(key, vec![first, slot]);
+                } else {
+                    self.key_to_slot.insert(key, slot);
+                }
+            }
+        }
+    }
+
     /// Quantize and add one vector (any norm; normalized internally).
     ///
     /// Returns the slot index holding the vector (stable until compaction).
@@ -1330,6 +1352,61 @@ mod tests {
     }
 
     #[test]
+    fn keyed_keys_survive_file_round_trip() {
+        // Regression for issue #32: the keyed map must survive a save/reload.
+        let dim = 64;
+        let mut idx = VecqIndex::new(dim, 42);
+        let v = rand_unit(dim, 11);
+        idx.add_keyed(10, &v);
+        idx.add_keyed(20, &rand_unit(dim, 22));
+        let bytes = idx.to_bytes();
+        let mut back = VecqIndex::from_bytes(&bytes).expect("parse");
+        assert_eq!(back.len(), 2);
+        assert!(back.contains_key(10));
+        assert!(back.contains_key(20));
+        assert_eq!(back.key_of(0), Some(10));
+        assert_eq!(back.key_of(1), Some(20));
+        let hits = back.search_keyed(&v, 5);
+        assert!(!hits.is_empty(), "keys must survive reload (issue #32)");
+        assert_eq!(hits[0].0, 10);
+        // The reloaded index is fully keyed-capable.
+        assert!(back.remove_keyed(20));
+        assert_eq!(back.len(), 1);
+        let slot = back.add_keyed_multi(10, &rand_unit(dim, 33));
+        assert_eq!(back.key_of(slot), Some(10));
+        assert!(back.relabel(10, 30));
+        assert_eq!(back.key_of(slot), Some(30));
+    }
+
+    #[test]
+    fn multi_key_round_trip_and_compact() {
+        let dim = 64;
+        let mut idx = VecqIndex::new(dim, 7);
+        idx.add_keyed(1, &rand_unit(dim, 101));
+        idx.add_keyed_multi(1, &rand_unit(dim, 202));
+        idx.add_keyed_multi(1, &rand_unit(dim, 303));
+        idx.add_keyed(2, &rand_unit(dim, 404));
+        let bytes = idx.to_bytes();
+        let mut back = VecqIndex::from_bytes(&bytes).expect("parse");
+        assert_eq!(back.len(), 4);
+        // Multi structure restored: remove one slot, key survives with two.
+        assert!(back.remove_keyed_at(1, 1));
+        assert!(back.contains_key(1));
+        assert_eq!(back.tombstones(), 1);
+        // Compact keeps keys and multi grouping.
+        back.compact();
+        assert_eq!(back.tombstones(), 0);
+        assert!(back.contains_key(1));
+        assert!(back.contains_key(2));
+        let probe = rand_unit(dim, 404);
+        assert_eq!(back.search_keyed(&probe, 5)[0].0, 2);
+        // Re-serialize stays stable.
+        let bytes2 = back.to_bytes();
+        assert_eq!(bytes2, back.to_bytes());
+        assert_eq!(VecqIndex::from_bytes(&bytes2).unwrap().len(), 3);
+    }
+
+    #[test]
     fn keyed_index_from_file_supports_keyed_adds() {
         let dim = 64;
         let mut idx = VecqIndex::new(dim, 41);
@@ -1547,11 +1624,8 @@ mod tests {
         for i in 0..8 {
             idx.add(&rand_unit(128, i + 50));
         }
-        let bytes = idx.to_bytes(); // v1.2 now
-        assert_eq!(
-            u16::from_le_bytes([bytes[4], bytes[5]]),
-            crate::format::V1_2
-        );
+        let bytes = idx.to_bytes(); // v1.3 now
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 259);
         let mut v11 = bytes.clone();
         v11[4] = 257u16.to_le_bytes()[0];
         v11[5] = 257u16.to_le_bytes()[1];
