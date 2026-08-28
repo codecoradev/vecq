@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] — 2026-08-28
+
+### Added
+- Keyed API: `add_keyed` (insert-or-replace under a stable `u64` key), `remove_keyed` (tombstones), `search_keyed`, `compact`, plus `key_of`/`contains_key`/`slots`/`tombstones` introspection (#10, #16)
+- Multi-vectors-per-key (`add_keyed_multi`, `remove_keyed_at`) and `relabel` — keyed parity with usearch (#26, #33)
+- x86_64 AVX2 scoring path with runtime detection, bit-identical to the scalar/NEON paths (enforced by tests) and 4-vector batching (#11, #17)
+- Matryoshka-aware `working_dim` truncation: `VecqIndex::with_working_dim(dim, working_dim, seed)` quantizes only the leading dims of Matryoshka-trained embeddings (#24, #30)
+- SQLite BLOB storage guide (`docs/SQLITE.md`): schema shapes, save/load pattern, atomicity, measured latencies, pitfalls (#12, #18)
+- Head-to-head benchmark vs TurboQuant-MSE and RaBitQ at 4 bits (`vs_quantizers` harness + results in `docs/BENCHMARK.md`) (#28, #34)
+- Per-architecture scoring-path table in `docs/BENCHMARK.md`
+
+### Changed
+- File format v1.2: the reserved header field now carries `working_dim` (0 = full dim); payload layout identical to v1.1, readers still accept v1 and v1.1
+- `len()`/`is_empty()` report live (non-tombstoned) vector counts; `slots()` reports total
+
+### Fixed
+- CLA bot exemption now matches actual bot logins (`dependabot[bot]`, not `app/dependabot`) so dependabot PRs pass CI (#14)
+
 ## [0.1.1] — 2026-08-26
 
 ### Added
