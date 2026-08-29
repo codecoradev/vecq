@@ -25,8 +25,9 @@
 //! scales (`count` entries) and residual codes (`count * padded/2` bytes) —
 //! before the keyed-slot table.
 //!
-//! Readers accept v1 through v1.4; writers emit 1.3 (plain) or 1.4
-//! (residual). The seed is stored in the header so the random sign diagonal
+//! Readers accept v1 through v1.5; writers emit 1.3 (plain 4-bit), 1.4
+//! (residual), or 1.5 (plain 5/6-bit, issue #39). The seed is stored in the
+//! header so the random sign diagonal
 //! can be regenerated identically on any platform: identical file ->
 //! identical query results, bit for bit.
 
@@ -38,6 +39,7 @@ const V1_1: u16 = 257;
 pub const V1_2: u16 = 258;
 const V1_3: u16 = 259;
 const V1_4: u16 = 260;
+const V1_5: u16 = 261;
 
 #[derive(Debug)]
 pub enum Error {
@@ -47,6 +49,7 @@ pub enum Error {
     DimMismatch { expected: usize, got: usize },
     InvalidWorkingDim { dim: usize, working_dim: usize },
     InvalidKeyTable,
+    InvalidWidth { width: u8 },
 }
 
 impl std::fmt::Display for Error {
@@ -62,6 +65,9 @@ impl std::fmt::Display for Error {
                 write!(f, "invalid working_dim {working_dim} for dim {dim}")
             }
             Error::InvalidKeyTable => write!(f, "invalid keyed-slot table"),
+            Error::InvalidWidth { width } => {
+                write!(f, "invalid code width {width} (supported: 4, 5, 6)")
+            }
         }
     }
 }
@@ -148,26 +154,41 @@ impl VecqIndex {
     /// indices. Keys of live keyed slots are stored in the keyed-slot table
     /// and are fully restored by [`VecqIndex::from_bytes`].
     pub fn to_bytes(&self) -> Vec<u8> {
-        let bpv = self.padded_dim() / 2;
+        let bits = self.bits();
+        let bpv = self.bytes_per_vector();
         let reserved: u16 = if self.working_dim() == self.dim() {
             0
         } else {
             self.working_dim() as u16
         };
-        let version = if self.is_residual() { V1_4 } else { V1_3 };
+        // 1.3 keeps 4-bit plain files byte-identical with pre-#39 output;
+        // 1.5 adds one width byte for non-4-bit plain indexes.
+        let wide = !self.is_residual() && bits != 4;
+        let version = if self.is_residual() {
+            V1_4
+        } else if wide {
+            V1_5
+        } else {
+            V1_3
+        };
         let extra = if self.is_residual() {
             self.live_slots() * (2 + bpv)
         } else {
             0
         };
-        let mut out =
-            Vec::with_capacity(24 + self.live_slots() * bpv + self.live_slots() * 2 + extra);
+        let width_byte = usize::from(wide);
+        let mut out = Vec::with_capacity(
+            24 + width_byte + self.live_slots() * bpv + self.live_slots() * 2 + extra,
+        );
         out.extend_from_slice(&MAGIC.to_le_bytes());
         out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&reserved.to_le_bytes());
         out.extend_from_slice(&(self.dim() as u32).to_le_bytes());
         out.extend_from_slice(&self.seed().to_le_bytes());
         out.extend_from_slice(&(self.len() as u32).to_le_bytes());
+        if wide {
+            out.push(bits);
+        }
         for slot in 0..self.slots() {
             if !self.slot_alive(slot) {
                 continue;
@@ -223,7 +244,12 @@ impl VecqIndex {
             return Err(Error::NotAStableFile);
         }
         let version = rd_u16(&bytes[4..6]);
-        if version != V1 && version != V1_1 && version != V1_2 && version != V1_3 && version != V1_4
+        if version != V1
+            && version != V1_1
+            && version != V1_2
+            && version != V1_3
+            && version != V1_4
+            && version != V1_5
         {
             return Err(Error::UnsupportedVersion(version));
         }
@@ -233,7 +259,7 @@ impl VecqIndex {
 
         // v1.2+ carry working_dim in the reserved field (0 = full dim).
         let working_dim = match version {
-            V1_2 | V1_3 | V1_4 => match rd_u16(&bytes[6..8]) as usize {
+            V1_2 | V1_3 | V1_4 | V1_5 => match rd_u16(&bytes[6..8]) as usize {
                 0 => dim,
                 w if w <= dim => w,
                 w => {
@@ -247,15 +273,28 @@ impl VecqIndex {
         };
 
         let padded = crate::rhdh::padded_dim(working_dim);
-        let codes_bytes = padded / 2;
+        // v1.5 carries an explicit Lloyd-Max width byte right after the
+        // header; all older versions are implicitly 4-bit.
+        let (index_bits, mut off) = if version == V1_5 {
+            if bytes.len() < 25 {
+                return Err(Error::Truncated);
+            }
+            let w = bytes[24];
+            if !matches!(w, 4..=6) {
+                return Err(Error::InvalidWidth { width: w });
+            }
+            (w, 25usize)
+        } else {
+            (4u8, 24usize)
+        };
+        let codes_bytes = (padded * index_bits as usize).div_ceil(8);
         let scale_bytes = if version == V1 { 4 } else { 2 };
-        let expected = 24 + count * (scale_bytes + codes_bytes);
+        let expected = off + count * (scale_bytes + codes_bytes);
         if bytes.len() < expected {
             return Err(Error::Truncated);
         }
 
         let mut scales = Vec::with_capacity(count);
-        let mut off = 24;
         for _ in 0..count {
             let s = if version == V1 {
                 f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap())
@@ -271,6 +310,7 @@ impl VecqIndex {
         index.scales = scales;
         index.n = count;
         index.init_dense(count);
+        index.bits = index_bits;
         if version == V1_4 {
             // Residual blocks: f16 scales2, then codes2.
             index.residual = true;
@@ -286,7 +326,7 @@ impl VecqIndex {
             }
             index.codes2 = bytes[off2..off2 + count * codes_bytes].to_vec();
         }
-        if version == V1_3 || version == V1_4 {
+        if version == V1_3 || version == V1_4 || version == V1_5 {
             // Keyed-slot table: [entries u32][slot u32 + key u64 each].
             if bytes.len() < code_end + 4 {
                 return Err(Error::Truncated);
@@ -367,6 +407,7 @@ mod tests {
     #[test]
     fn v11_file_smaller_and_v1_readable() {
         let mut idx = VecqIndex::new(384, 7);
+        idx.set_bits(4); // legacy layout exercise: 4-bit payload, known offsets
         for i in 0..30 {
             idx.add(&unit(384, i + 3));
         }
