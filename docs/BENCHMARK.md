@@ -15,11 +15,31 @@ Spike results, measured on aarch64 (Oracle ARM host), single-threaded, release p
 
 | engine | build | ms/query | recall@10 | bytes/vector | compression |
 |---|---|---|---|---|---|
-| vecq 4-bit | 64 ms | 0.89 | **0.961** | **514** | **5.98x** vs f32 |
+| vecq 5-bit (default) | 75 ms | 3.21 | **0.979** | 642 | **4.78x** vs f32 |
+| vecq 4-bit | 64 ms | 0.89 | 0.958 | 514 | 5.98x vs f32 |
 | usearch f32 (HNSW) | 893 ms | 0.23 | 0.995 | 3,072 | 1x |
 | f32 brute force | — | 1.12 | 1.000 (ref) | 3,072 | 1x |
 
-Recall@1 = 0.910. Recall gate for the spike was **≥ 0.95** → **passed**.
+Recall@1 = 0.970 (default) / 0.910 (4-bit). Recall gate for the spike was **≥ 0.95** → **passed** (both widths).
+
+## Width matrix (#39/#40, Aug 2026)
+
+All modes on the same dataset, aarch64 release, post wide-kernel:
+
+| mode | recall@1 | recall@10 | bytes/vec | compression | ms/q |
+|---|---|---|---|---|---|
+| plain 4-bit | 0.910 | 0.958 | 514 | 5.98x | 0.89 |
+| plain 5-bit (default) | 0.970 | 0.979 | 642 | 4.78x | 3.21 |
+| plain 6-bit | 0.960 | 0.980 | 770 | 3.99x | 3.24 |
+| plain 4-bit + residual | **0.990** | **0.984** | 1,028 | 2.99x | 1.76 |
+
+- Default is the compression/recall sweet spot; 6-bit matches residual-class
+  recall at 25% less storage; residual is the recall mode and — while 5/6-bit
+  scoring is extraction-bound — also the fastest high-recall option.
+- 5/6-bit latency ceiling: `vqtbl` cannot address 128/256-byte centroid
+  tables, so vector gather needs a range-split (≈2–3x the 4-bit gather cost).
+  Split-layout codes (separate nibble/high-bit streams) project only
+  ~2.2–2.7 ms/q — tracked with the full analysis in issue #40.
 
 ## Changelog vs first spike measurement
 
@@ -33,8 +53,9 @@ Recall@1 = 0.910. Recall gate for the spike was **≥ 0.95** → **passed**.
 ## Analysis
 
 ### What vecq wins
-- **Memory**: 514 B/vector vs 3,072 B — a **5.98x** reduction with no training.
-  A 300 MB f32 index projects to ~50 MB (e.g. a 768-dim index of ~100k memories).
+- **Memory**: 642 B/vector at default width vs 3,072 B — a **4.78x** reduction
+  with no training (5.98x at 4-bit). A 300 MB f32 index projects to ~63 MB
+  (e.g. a 768-dim index of ~100k memories).
 - **Build time**: 14x faster than usearch HNSW construction (64 ms vs 893 ms) —
   no graph to build, just quantize.
 - **Determinism**: fixed-order accumulation over packed codes; same file →
@@ -43,14 +64,16 @@ Recall@1 = 0.910. Recall gate for the spike was **≥ 0.95** → **passed**.
 - **Zero dependencies** in the core quantization path.
 
 ### What vecq loses (expected)
-- **Search throughput**: 8x slower than HNSW at n=2,000 (0.89 vs 0.23 ms/q).
-  This is the documented brute-force vs graph trade-off and matches the
-  MonaVec finding (2–14x slower than usearch/hnswlib). On-device with n ≤ ~10k
-  and battery/thermal constraints, sub-2 ms/query is already interactive.
+- **Search throughput**: 14x slower than HNSW at default width (3.21 vs
+  0.23 ms/q); the 4-bit width closes it to 4x (0.89). This is the documented
+  brute-force vs graph trade-off and matches the MonaVec finding (2–14x
+  slower than usearch/hnswlib). On-device with n ≤ ~10k and battery/thermal
+  constraints, sub-2 ms/query (4-bit, residual) is already interactive.
 
 ### Known limitations
-- Explicit NEON intrinsics (tbl-based nibble LUT gather) is the next
-  throughput lever; the current gain comes from auto-vectorization only.
+- 5/6-bit scoring is extraction-bound on aarch64 (3.2 ms/q vs 0.89 at 4-bit);
+  the remaining lever (split-layout codes) has a bounded ceiling — see the
+  width matrix above and issue #40.
 - Search is O(n) brute force; no ANN graph on top of the codes yet.
 - f16 scales perturb scores by <1e-3; ranking ties near the cutoff can shift
   by one position (covered by tests: top-10 overlap ≥ 9/10, top-1 unchanged).
@@ -166,9 +189,10 @@ Honest labeling:
 
 ## Conclusion
 
-The spike validates the technique: training-free 4-bit RHDH + Lloyd-Max
-quantization with asymmetric scoring keeps Recall@10 above 0.95 at ~6x
-compression on real Gemma embeddings. Recommended next steps:
+The spike validates the technique: training-free RHDH + Lloyd-Max
+quantization (4/5/6-bit, default 5-bit) with asymmetric scoring keeps
+Recall@10 well above 0.95 at 4.8–6x compression on real Gemma embeddings.
+Recommended next steps:
 
 1. ~~Explicit NEON nibble decode (target ≤ 0.8 ms/q at n=2k)~~ — done
    (explicit NEON + AVX2 nibble-gather paths with bit-identity tests)
