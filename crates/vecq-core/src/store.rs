@@ -673,10 +673,37 @@ impl VecqIndex {
             self.codes2[b] = byte;
         }
         // Term coefficients: both terms estimate the cosine of the full
-        // reconstruction x̂ = x̂0 + rms·d1, so both divide by its norm
-        // sqrt(sum_sq + rms²·padded). Term1's numerator is rms·raw1 (raw1 =
-        // q·dequant(c1) estimates q·(r/rms)).
-        let denom = (sum_sq + rms * rms * self.padded as f32).sqrt();
+        // reconstruction x̂ = x̂0 + rms·d1, so both divide by ‖x̂‖. Term1's
+        // numerator is rms·raw1 (raw1 = q·dequant(c1) estimates q·(r/rms)).
+        //
+        // #23 (estimator fix): ‖x̂‖² must be the EXACT squared norm of the
+        // vector we actually score against — including the cross term
+        // 2·rms·⟨d0, d1⟩ (nonzero: the residual d1 correlates with d0's
+        // quantization error pattern, not with an independent Gaussian) and
+        // the actual quantized second-pass energy ⟨d1, d1⟩ (not the raw
+        // residual rms²·padded). Using sqrt(sum_sq + rms²·padded) instead
+        // injects per-vector score distortion that RAISES score variance
+        // enough to flip top-10 rankings: measured recall 0.58 vs plain
+        // 0.66 on the adversarial clustered set despite 4.5x better MSE
+        // (bias identical, sd +40%). The cross term and ⟨d1,d1⟩ are folded
+        // into the stored coefficients at encode time — no format change,
+        // scoring kernels untouched.
+        let mut cross = 0f32; // ⟨d0, d1⟩
+        let mut norm1_sq = 0f32; // ⟨d1, d1⟩
+        for i in 0..self.padded {
+            let b = base + i / 2;
+            let (c0, c1) = if i % 2 == 0 {
+                (self.codes[b] & 0x0F, self.codes2[b] & 0x0F)
+            } else {
+                (self.codes[b] >> 4, self.codes2[b] >> 4)
+            };
+            let d0 = lloyd::dequantize_4bit(c0);
+            let d1 = lloyd::dequantize_4bit(c1);
+            cross += d0 * d1;
+            norm1_sq += d1 * d1;
+        }
+        let norm_sq = sum_sq + 2.0 * rms * cross + rms * rms * norm1_sq;
+        let denom = norm_sq.max(1e-12).sqrt();
         ((scale0 * sum_sq.sqrt()) / denom, Some(rms / denom))
     }
 
@@ -2191,14 +2218,22 @@ mod tests {
         };
         let r_plain = recall(&plain);
         let r_resid = recall(&resid);
-        // TODO(#23): reconstruction MSE improves 4.5x with residual codes,
-        // yet recall on this adversarial set is slightly BELOW plain
-        // (0.58 vs 0.66) — the two-term score estimator needs revisiting
-        // (candidates: true-norm vs reconstructed-norm denominators,
-        // f16 scale2 rounding, per-vector rms score-scale variance).
-        // Sanity floor until the estimator is settled.
+        // Residual must clearly BEAT plain on this set: same 514 B/vector
+        // budget, finer reconstruction. (Estimator note: the two-term score
+        // must divide by the EXACT reconstruction norm including the
+        // 2·rms·⟨d0,d1⟩ cross term — see encode_into. With the approximate
+        // sqrt(sum_sq + rms²·padded) denominator, score variance rose ~40%
+        // and recall DROPPED to 0.58 despite 4.5x better MSE.)
         assert!(
-            r_resid >= 0.5,
+            r_resid > r_plain,
+            "residual must beat plain: resid {r_resid} vs plain {r_plain}"
+        );
+        assert!(
+            r_resid - r_plain >= 0.05,
+            "residual gain must be substantial: resid {r_resid} vs plain {r_plain}"
+        );
+        assert!(
+            r_resid >= 0.8,
             "residual recall {r_resid} (plain {r_plain})"
         );
     }
