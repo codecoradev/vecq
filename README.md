@@ -1,8 +1,8 @@
 # vecq
 
-> Training-free 4-bit vector quantization and search — the "SQLite profile" for vector storage on edge devices.
+> Training-free vector quantization at configurable width (4/5/6-bit) and search — the "SQLite profile" for vector storage on edge devices.
 
-`vecq` compresses dense embeddings **~6x** into a single deterministic file, using a zero-dependency pure-Rust crate. No training pass, no server, no C++.
+`vecq` compresses dense embeddings **~5x** into a single deterministic file, using a zero-dependency pure-Rust crate. No training pass, no server, no C++.
 
 ```
 f32 index:  3,072 bytes/vector (768-dim)
@@ -28,7 +28,7 @@ It is the semantic-search engine for on-device and offline-first workloads — t
 ## How it works
 
 1. **RHDH rotation** — random diagonal sign + Walsh-Hadamard transform spreads any vector's energy so coordinates become approximately N(0,1) (the flatness property). The sign seed lives in the file header, so results are bit-identical on any architecture.
-2. **Lloyd-Max 4-bit quantization** — optimal scalar quantizer centroids for N(0,1), precomputed offline and embedded as constants. No training on your data.
+2. **Lloyd-Max quantization** — optimal scalar quantizer centroids for N(0,1), precomputed offline and embedded as constants for 4, 5, and 6 bits (default **5-bit** = compression/recall sweet spot). No training on your data.
 3. **Asymmetric scoring** — queries stay f32; only the database is quantized. The score is an unbiased cosine-similarity estimate with per-vector scale correction, computed with an explicit NEON path on aarch64 and a portable scalar path elsewhere — both produce identical bits.
 
 Based on techniques validated in the RaBitQ / MonaVec line of research (random rotation + fixed optimal quantizers, training-free).
@@ -39,6 +39,11 @@ Based on techniques validated in the RaBitQ / MonaVec line of research (random r
 use vecq_core::VecqIndex;
 
 let mut index = VecqIndex::new(768, 42 /* seed */);
+// Optional: pick the Lloyd-Max width before the first `add`.
+// 5-bit (default): 4.8x compression, recall@10 ≈ 0.98
+// 4-bit: 6.0x compression, max squeeze (required for cascade search)
+// 6-bit: 4.0x compression, recall ≈ residual mode at 25% less storage
+index.set_bits(5);
 for v in &vectors { index.add(v); }
 
 let hits: Vec<(usize, f32)> = index.search(&query, 10);
@@ -67,8 +72,8 @@ assert_eq!(index.search(&query, 10), back.search(&query, 10));
 
 - **Deterministic**: same file + same query → identical result bits on any platform. The seed lives in the header, the scoring path has a fixed association order and no FMA contraction, and a unit test enforces SIMD/scalar bit-identity.
 - **Zero dependencies** in `vecq-core`'s quantization path.
-- **Recall@10 ≥ 0.95** on real embedding data at 6x compression (see `docs/BENCHMARK.md`).
-- **Forward-compatible format**: readers accept v1 (f32 scales), v1.1 (f16 scales), v1.2 (Matryoshka working_dim) and v1.3 (keyed-slot table) files.
+- **Recall@10 ≥ 0.95** on real embedding data at default width (4.8x compression); 6-bit reaches ≈0.98 at 4x (see `docs/BENCHMARK.md`).
+- **Forward-compatible format**: readers accept v1 (f32 scales), v1.1 (f16 scales), v1.2 (Matryoshka working_dim), v1.3 (keyed-slot table), v1.4 (residual codes) and v1.5 (explicit width byte) files.
 
 ## Matryoshka models
 

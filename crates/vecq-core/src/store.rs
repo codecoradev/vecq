@@ -30,7 +30,7 @@ pub struct VecqIndex {
     padded: usize,
     pub(crate) seed: u64,
     transform: Rhdh,
-    pub(crate) codes: Vec<u8>, // n * padded/2 nibbles, low nibble = dim i*2
+    pub(crate) codes: Vec<u8>, // n * bpv codes, bit-packed LSB-first (4-bit = nibbles)
     pub(crate) scales: Vec<f32>, // per-vector dequantization scale
     pub(crate) n: usize,       // total slots in use (live + tombstoned)
     keys: Vec<Option<u64>>,    // slot -> caller key (keyed slots only)
@@ -51,8 +51,11 @@ pub struct VecqIndex {
     // per-vector RMS, plus that RMS as the correction scale. Empty in plain
     // mode.
     pub(crate) residual: bool,
-    pub(crate) codes2: Vec<u8>,   // n * padded/2 residual nibbles
+    pub(crate) codes2: Vec<u8>,   // n * bpv residual codes
     pub(crate) scales2: Vec<f32>, // per-vector residual RMS
+    /// Lloyd-Max code width in bits (4, 5, or 6; issue #39). Frozen once
+    /// vectors are added (`set_bits` asserts emptiness).
+    pub(crate) bits: u8,
 }
 
 impl VecqIndex {
@@ -103,6 +106,9 @@ impl VecqIndex {
             residual: false,
             codes2: Vec::new(),
             scales2: Vec::new(),
+            // Default width: 5-bit, the compression/recall sweet spot (#39):
+            // 4.79x, recall@10 0.983 real — ≈ residual at half its storage.
+            bits: 5,
         }
     }
 
@@ -116,7 +122,41 @@ impl VecqIndex {
     pub fn with_residual(dim: usize, seed: u64) -> Self {
         let mut idx = Self::with_working_dim(dim, dim, seed);
         idx.residual = true;
+        idx.bits = 4; // residual is 4-bit-base only (issue #39)
         idx
+    }
+
+    /// Set the Lloyd-Max code width: 4 (legacy, max compression 5.98x),
+    /// 5 (default sweet spot, 4.79x @ recall@10 0.983), or 6 (recall ≈
+    /// residual at 25% less storage, single-pass). Must be called on an
+    /// empty index before the first `add`.
+    pub fn set_bits(&mut self, bits: u8) -> &mut Self {
+        assert!(
+            matches!(bits, 4..=6),
+            "unsupported bit width {bits} (supported: 4, 5, 6)"
+        );
+        assert!(self.n == 0, "bit width is frozen once vectors are added");
+        assert!(
+            !(self.residual && bits != 4),
+            "residual mode requires the 4-bit width"
+        );
+        self.bits = bits;
+        self
+    }
+
+    /// Configured Lloyd-Max code width in bits (4, 5, or 6).
+    pub fn bits(&self) -> u8 {
+        self.bits
+    }
+
+    /// Stored code bytes per vector at the configured width (bit-packed
+    /// LSB-first; exact since `padded % 8 == 0`).
+    pub fn bytes_per_vector(&self) -> usize {
+        self.bpv()
+    }
+
+    fn bpv(&self) -> usize {
+        (self.padded * self.bits as usize).div_ceil(8)
     }
 
     /// Whether this index carries second-pass residual codes.
@@ -163,10 +203,6 @@ impl VecqIndex {
     }
 
     // -- crate-internal accessors used by the persistence format ---------
-
-    pub(crate) fn padded_dim(&self) -> usize {
-        self.padded
-    }
 
     pub(crate) fn live_slots(&self) -> usize {
         self.live
@@ -244,7 +280,7 @@ impl VecqIndex {
             Some(slot) => {
                 // Replace in place: codes change, cascade signatures go stale.
                 self.signature = None;
-                let (scale0, scale2) = self.encode_into(slot * (self.padded / 2), v);
+                let (scale0, scale2) = self.encode_into(slot * (self.bpv()), v);
                 self.scales[slot] = scale0;
                 if let Some(s2) = scale2 {
                     self.scales2[slot] = s2;
@@ -398,6 +434,11 @@ impl VecqIndex {
     /// `n * padded/4` bytes of memory. Adding, replacing or compacting
     /// vectors drops the signatures — call this again to re-enable.
     pub fn enable_cascade(&mut self) {
+        assert!(
+            self.bits == 4,
+            "cascade search requires the 4-bit width (got {}-bit)",
+            self.bits
+        );
         self.signature = Some(self.derive_signature());
     }
 
@@ -414,7 +455,7 @@ impl VecqIndex {
     fn derive_signature(&self) -> Vec<u8> {
         let bytes_per = self.sig_bytes();
         let mut sig = vec![0u8; self.n * bytes_per];
-        let bpv = self.padded / 2;
+        let bpv = self.bpv();
         for slot in 0..self.n {
             let base = slot * bpv;
             let sig_base = slot * bytes_per;
@@ -549,7 +590,7 @@ impl VecqIndex {
         }
         // Slots shift: cascade signatures go stale (re-enable after).
         self.signature = None;
-        let bpv = self.padded / 2;
+        let bpv = self.bpv();
         let mut codes = Vec::with_capacity(self.live * bpv);
         let mut scales = Vec::with_capacity(self.live);
         let mut alive = Vec::with_capacity(self.live);
@@ -591,7 +632,7 @@ impl VecqIndex {
     fn append_slot(&mut self, v: &[f32], key: Option<u64>) -> usize {
         self.signature = None; // codes change: cascade signatures go stale
         let slot = self.n;
-        let (scale0, scale2) = self.encode_into(slot * (self.padded / 2), v);
+        let (scale0, scale2) = self.encode_into(slot * (self.bpv()), v);
         self.scales.push(scale0);
         if let Some(s2) = scale2 {
             self.scales2.push(s2);
@@ -620,23 +661,18 @@ impl VecqIndex {
         let mut rotated = Vec::with_capacity(self.padded);
         self.transform.apply(&unit, &mut rotated);
 
-        // Quantize to 4-bit codes, nibble-packed.
-        let bytes_per_vec = self.padded / 2;
+        // Quantize at the configured width, bit-packed LSB-first.
+        let bits = self.bits;
+        let bytes_per_vec = self.bpv();
         if self.codes.len() < base + bytes_per_vec {
             self.codes.resize(base + bytes_per_vec, 0);
         }
         let mut sum_sq = 0f32;
         let mut residual_buf = Vec::new();
         for (i, &x) in rotated.iter().enumerate() {
-            let code = lloyd::quantize_4bit(x);
-            let b = base + i / 2;
-            let byte = if i % 2 == 0 {
-                (self.codes[b] & 0xF0) | code
-            } else {
-                (self.codes[b] & 0x0F) | (code << 4)
-            };
-            self.codes[b] = byte;
-            let d = lloyd::dequantize_4bit(code);
+            let code = lloyd::quantize(x, bits);
+            pack_code(&mut self.codes, base, i, bits, code);
+            let d = lloyd::dequantize(code, bits);
             sum_sq += d.powi(2);
             if self.residual {
                 if residual_buf.is_empty() {
@@ -663,14 +699,8 @@ impl VecqIndex {
             self.codes2.resize(base + bytes_per_vec, 0);
         }
         for (i, &r) in residual_buf.iter().enumerate() {
-            let code = lloyd::quantize_4bit(r / rms);
-            let b = base + i / 2;
-            let byte = if i % 2 == 0 {
-                (self.codes2[b] & 0xF0) | code
-            } else {
-                (self.codes2[b] & 0x0F) | (code << 4)
-            };
-            self.codes2[b] = byte;
+            let code = lloyd::quantize(r / rms, bits);
+            pack_code(&mut self.codes2, base, i, bits, code);
         }
         // Term coefficients: both terms estimate the cosine of the full
         // reconstruction x̂ = x̂0 + rms·d1, so both divide by ‖x̂‖. Term1's
@@ -752,24 +782,28 @@ impl VecqIndex {
     /// tests.
     #[inline]
     pub fn score(&self, pq: &PreparedQuery, idx: usize) -> f32 {
-        let base = idx * (self.padded / 2);
-        let codes = &self.codes[base..base + self.padded / 2];
+        let bits = self.bits;
+        let base = idx * self.bpv();
+        let codes = &self.codes[base..base + self.bpv()];
         let q = &pq.rotated[..self.padded];
-        let raw0 = self.score_raw(codes, q, &pq.lut);
+        let raw0 = self.score_raw(codes, q, &pq.lut, bits);
         if !self.residual {
             return raw0 * self.scales[idx];
         }
         // Residual term: same kernel, same association order, added after the
         // first-pass term (bit-identical across all paths).
-        let codes1 = &self.codes2[base..base + self.padded / 2];
-        let raw1 = self.score_raw(codes1, q, &pq.lut);
+        let codes1 = &self.codes2[base..base + self.bpv()];
+        let raw1 = self.score_raw(codes1, q, &pq.lut, bits);
         raw0 * self.scales[idx] + raw1 * self.scales2[idx]
     }
 
     /// Score one vector's code bytes against a prepared query, dispatching to
     /// the best available kernel for the target.
     #[inline]
-    fn score_raw(&self, codes: &[u8], q: &[f32], lut: &[f32; 16]) -> f32 {
+    fn score_raw(&self, codes: &[u8], q: &[f32], lut: &[f32; 16], bits: u8) -> f32 {
+        if bits != 4 {
+            return score_wide_scalar(codes, q, bits);
+        }
         #[cfg(target_arch = "aarch64")]
         {
             // NEON is baseline on aarch64.
@@ -819,7 +853,7 @@ impl VecqIndex {
 
         let pq = self.prepare_query(q);
         let k = k.min(self.live).max(1);
-        let bpv = self.padded / 2;
+        let bpv = self.bpv();
         // f32 -> u32 monotonic key (NaN-safe, preserves total order):
         // flip all bits for negatives, flip sign bit for positives.
         let key = |s: f32| -> u32 {
@@ -858,32 +892,40 @@ impl VecqIndex {
         {
             // Batch 4 vectors per pass: shared q loads + LUT setup. Tombstoned
             // slots are still scored (keeping the batch dense) but filtered
-            // before entering the heap.
-            while idx + 4 <= self.n {
-                let codes4 = &self.codes[idx * bpv..(idx + 4) * bpv];
-                let raw = unsafe { neon::score_neon4(codes4, q_rot, &pq.lut) };
-                let raw1 = if self.residual {
-                    Some(unsafe {
-                        neon::score_neon4(&self.codes2[idx * bpv..(idx + 4) * bpv], q_rot, &pq.lut)
-                    })
-                } else {
-                    None
-                };
-                for (v, &r) in raw.iter().enumerate() {
-                    let si = idx + v;
-                    if self.alive[si] {
-                        consider(combine(r, raw1.map(|a| a[v]), si), si, &mut heap);
+            // before entering the heap. NEON batch kernels are 4-bit-only;
+            // wider widths fall through to the scalar loop below.
+            if self.bits == 4 {
+                while idx + 4 <= self.n {
+                    let codes4 = &self.codes[idx * bpv..(idx + 4) * bpv];
+                    let raw = unsafe { neon::score_neon4(codes4, q_rot, &pq.lut) };
+                    let raw1 = if self.residual {
+                        Some(unsafe {
+                            neon::score_neon4(
+                                &self.codes2[idx * bpv..(idx + 4) * bpv],
+                                q_rot,
+                                &pq.lut,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    for (v, &r) in raw.iter().enumerate() {
+                        let si = idx + v;
+                        if self.alive[si] {
+                            consider(combine(r, raw1.map(|a| a[v]), si), si, &mut heap);
+                        }
                     }
+                    idx += 4;
                 }
-                idx += 4;
             }
         }
         #[cfg(target_arch = "x86_64")]
         {
-            if use_avx2 {
+            if use_avx2 && self.bits == 4 {
                 // Batch 4 vectors per pass: shared q deinterleave. Tombstoned
                 // slots are still scored (keeping the batch dense) but
-                // filtered before entering the heap.
+                // filtered before entering the heap. AVX2 batch kernels are
+                // 4-bit-only; wider widths fall through to the scalar loop.
                 while idx + 4 <= self.n {
                     let codes4 = &self.codes[idx * bpv..(idx + 4) * bpv];
                     // SAFETY: AVX2 availability checked via `use_avx2`.
@@ -931,6 +973,52 @@ impl VecqIndex {
         out.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("no NaN scores"));
         out
     }
+}
+
+/// Write `code` for dimension `i` into the bit-packed code block at
+/// `base` (LSB-first: dimension i occupies bits [i·w, (i+1)·w) of the
+/// block). Read-modify-write on a 16-bit window so codes spanning a byte
+/// boundary (5/6-bit) and sibling codes (4-bit pairs) survive replaces.
+#[inline]
+fn pack_code(bytes: &mut [u8], base: usize, i: usize, bits: u8, code: u8) {
+    let w = bits as usize;
+    let bit_off = i * w;
+    let b = base + bit_off / 8;
+    let shift = (bit_off % 8) as u32;
+    let hi = bytes.get(b + 1).copied().unwrap_or(0);
+    let window = u16::from_le_bytes([bytes[b], hi]);
+    let mask = ((1u16 << w) - 1) << shift;
+    let out = (window & !mask) | ((code as u16) << shift);
+    bytes[b] = out as u8;
+    if let Some(next) = bytes.get_mut(b + 1) {
+        *next = (out >> 8) as u8;
+    }
+}
+
+/// Read `code` for dimension `i` from a bit-packed code block (LSB-first,
+/// relative to the start of the block).
+#[inline]
+fn unpack_code(bytes: &[u8], i: usize, bits: u8) -> u8 {
+    let w = bits as usize;
+    let bit_off = i * w;
+    let b = bit_off / 8;
+    let shift = (bit_off % 8) as u32;
+    let hi = bytes.get(b + 1).copied().unwrap_or(0);
+    let window = u16::from_le_bytes([bytes[b], hi]);
+    ((window >> shift) & ((1u16 << w) - 1)) as u8
+}
+
+/// Scalar scoring for widths > 4 (5/6-bit): one unpack + centroid lookup per
+/// dimension. The NEON/AVX2 batch kernels remain 4-bit-only (fast-follow);
+/// this path is single-pass like `score_scalar`, just with wider codes.
+fn score_wide_scalar(codes: &[u8], q: &[f32], bits: u8) -> f32 {
+    let centroids = lloyd::centroids(bits);
+    let mut sum = 0f32;
+    for (i, &qi) in q.iter().enumerate() {
+        let c = unpack_code(codes, i, bits) as usize;
+        sum += qi * centroids[c];
+    }
+    sum
 }
 
 /// Reference 8-bucket scalar scoring. Bucket j accumulates byte j, j+8, ...
@@ -1356,23 +1444,30 @@ mod tests {
     #[test]
     fn score_reproducible_and_close_to_naive() {
         let dim = 128;
-        let mut idx = VecqIndex::new(dim, 13);
-        for i in 0..50 {
-            idx.add(&rand_unit(dim, i + 21));
-        }
-        let q = rand_unit(dim, 321);
-        let pq = idx.prepare_query(&q);
-        for vi in 0..50 {
-            let base = vi * (idx.padded() / 2);
-            let mut naive = 0f32;
-            for i in 0..idx.padded() {
-                let b = idx.codes[base + i / 2];
-                let code = if i % 2 == 0 { b & 0x0F } else { b >> 4 };
-                naive += pq.rotated[i] * pq.lut[code as usize];
+        // Cover every width: score must equal a naive unpack+dequantize walk
+        // of the stored codes, and be bit-reproducible.
+        for bits in [4u8, 5, 6] {
+            let mut idx = VecqIndex::new(dim, 13);
+            idx.set_bits(bits);
+            for i in 0..50 {
+                idx.add(&rand_unit(dim, i + 21));
             }
-            let s = idx.score(&pq, vi);
-            assert_eq!(s.to_bits(), idx.score(&pq, vi).to_bits());
-            assert!((s - naive * idx.scales[vi]).abs() < 1e-5, "vector {vi}");
+            let q = rand_unit(dim, 321);
+            let pq = idx.prepare_query(&q);
+            for vi in 0..50 {
+                let base = vi * idx.bytes_per_vector();
+                let mut naive = 0f32;
+                for i in 0..idx.padded() {
+                    let code = unpack_code(&idx.codes[base..], i, bits) as usize;
+                    naive += pq.rotated[i] * lloyd::centroids(bits)[code];
+                }
+                let s = idx.score(&pq, vi);
+                assert_eq!(s.to_bits(), idx.score(&pq, vi).to_bits());
+                assert!(
+                    (s - naive * idx.scales[vi]).abs() < 1e-5,
+                    "bits {bits} vector {vi}"
+                );
+            }
         }
     }
 
@@ -1537,7 +1632,18 @@ mod tests {
         let dim = 384;
         let mut idx = VecqIndex::new(dim, 1);
         idx.add(&rand_unit(dim, 11));
-        assert_eq!(idx.codes.len(), 512 / 2);
+        // Default (5-bit): padded 512 * 5 bits = 320 bytes.
+        assert_eq!(idx.codes.len(), 320);
+        assert_eq!(idx.bytes_per_vector(), 320);
+        // 4-bit legacy: 256 bytes. 6-bit: 384 bytes.
+        let mut idx4 = VecqIndex::new(dim, 1);
+        idx4.set_bits(4);
+        idx4.add(&rand_unit(dim, 11));
+        assert_eq!(idx4.codes.len(), 256);
+        let mut idx6 = VecqIndex::new(dim, 1);
+        idx6.set_bits(6);
+        idx6.add(&rand_unit(dim, 11));
+        assert_eq!(idx6.codes.len(), 384);
     }
 
     #[test]
@@ -1937,6 +2043,7 @@ mod tests {
         // working_dim == dim (only the version field differs), so both loads
         // must agree bit for bit.
         let mut idx = VecqIndex::new(128, 33);
+        idx.set_bits(4); // legacy v1.1 payloads are 4-bit
         for i in 0..8 {
             idx.add(&rand_unit(128, i + 50));
         }
@@ -2038,6 +2145,7 @@ mod tests {
         let dim = 128;
         let base = clustered(60, dim, 10, 5, 0.5);
         let mut idx = VecqIndex::new(dim, 42);
+        idx.set_bits(4); // cascade signatures are 4-bit-only
         for v in &base {
             idx.add(v);
         }
@@ -2081,6 +2189,7 @@ mod tests {
         let dim = 128;
         let base = clustered(1000, dim, 50, 9, 0.1);
         let mut idx = VecqIndex::new(dim, 42);
+        idx.set_bits(4); // cascade signatures are 4-bit-only
         for v in &base {
             idx.add(v);
         }
@@ -2091,6 +2200,7 @@ mod tests {
         // a 20% scan still recovers most of the truth.
         let base = clustered(1000, dim, 50, 9, 0.5);
         let mut idx = VecqIndex::new(dim, 42);
+        idx.set_bits(4); // cascade signatures are 4-bit-only
         for v in &base {
             idx.add(v);
         }
@@ -2113,6 +2223,7 @@ mod tests {
         let dim = 64;
         let base = clustered(80, dim, 8, 3, 0.5);
         let mut idx = VecqIndex::new(dim, 42);
+        idx.set_bits(4); // cascade signatures are 4-bit-only
         for v in &base {
             idx.add(v);
         }
@@ -2137,6 +2248,7 @@ mod tests {
         let dim = 64;
         let base = clustered(40, dim, 6, 11, 0.5);
         let mut idx = VecqIndex::new(dim, 42);
+        idx.set_bits(4); // cascade signatures are 4-bit-only
         for v in &base {
             idx.add_keyed(100 + 1, v);
         }
@@ -2158,6 +2270,7 @@ mod tests {
     #[test]
     fn cascade_on_empty_index_returns_empty() {
         let mut idx = VecqIndex::new(64, 1);
+        idx.set_bits(4); // cascade signatures are 4-bit-only
         idx.enable_cascade();
         let q = rand_unit(64, 2);
         assert!(idx.search_cascade(&q, 5, 50).is_empty());
@@ -2167,6 +2280,7 @@ mod tests {
     fn cascade_r_clamps_to_live_count() {
         let dim = 32;
         let mut idx = VecqIndex::new(dim, 3);
+        idx.set_bits(4); // cascade signatures are 4-bit-only
         for i in 0..4 {
             idx.add(&rand_unit(dim, i + 80));
         }
@@ -2183,6 +2297,7 @@ mod tests {
         let working = 64;
         let base = clustered(50, dim, 7, 13, 0.5);
         let mut idx = VecqIndex::with_working_dim(dim, working, 42);
+        idx.set_bits(4); // cascade signatures are 4-bit-only
         for v in &base {
             idx.add(v);
         }
@@ -2201,6 +2316,7 @@ mod tests {
         let dim = 128;
         let base = clustered(600, dim, 30, 19, 0.5);
         let mut plain = VecqIndex::new(dim, 42);
+        plain.set_bits(4); // the 4-bit-vs-residual comparison from #38
         let mut resid = VecqIndex::with_residual(dim, 42);
         for v in &base {
             plain.add(v);
@@ -2298,11 +2414,70 @@ mod tests {
 
     #[test]
     fn plain_index_stays_v13() {
+        // 4-bit plain stays v1.3 (byte-identical with pre-#39 files);
+        // 5/6-bit plain promotes to v1.5 with an explicit width byte.
         let mut idx = VecqIndex::new(64, 3);
         idx.add(&rand_unit(64, 1));
         assert!(!idx.is_residual());
         let bytes = idx.to_bytes();
-        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 259, "v1.3 = 259");
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 261, "v1.5 = 261");
+        assert_eq!(bytes[24], 5, "width byte");
+        let mut idx4 = VecqIndex::new(64, 3);
+        idx4.set_bits(4);
+        idx4.add(&rand_unit(64, 1));
+        let bytes4 = idx4.to_bytes();
+        assert_eq!(
+            u16::from_le_bytes([bytes4[4], bytes4[5]]),
+            259,
+            "v1.3 = 259"
+        );
+        // Residual stays v1.4 regardless of nothing (4-bit base only).
+        let mut res = VecqIndex::with_residual(64, 3);
+        res.add(&rand_unit(64, 1));
+        let bytes_r = res.to_bytes();
+        assert_eq!(
+            u16::from_le_bytes([bytes_r[4], bytes_r[5]]),
+            260,
+            "v1.4 = 260"
+        );
+    }
+
+    #[test]
+    fn wide_plain_matches_or_beats_residual_recall() {
+        // Issue #39 headline: a single-pass plain index at 5 or 6 bits
+        // matches/beats the two-pass residual index on recall — at a
+        // smaller or equal byte budget — so width is the preferred lever
+        // and residual stays an opt-in for tiny-code regimes.
+        let dim = 128;
+        let base = clustered(600, dim, 30, 19, 0.5);
+        let mut plain6 = VecqIndex::new(dim, 42);
+        plain6.set_bits(6);
+        let mut resid = VecqIndex::with_residual(dim, 42);
+        for v in &base {
+            plain6.add(v);
+            resid.add(v);
+        }
+        let queries = &base[590..];
+        let recall = |idx: &VecqIndex| -> f32 {
+            let mut sum = 0f32;
+            for q in queries {
+                let truth = exact_top(&base, q, 10);
+                let got: Vec<usize> = idx.search(q, 10).into_iter().map(|(i, _)| i).collect();
+                sum += truth.iter().filter(|t| got.contains(t)).count() as f32 / 10.0;
+            }
+            sum / queries.len() as f32
+        };
+        let r6 = recall(&plain6);
+        let rr = recall(&resid);
+        // Byte budget: 6-bit plain = 384 B/vec vs residual (2 x 256 B) = 512 B/vec.
+        assert!(
+            2 * resid.bytes_per_vector() > plain6.bytes_per_vector(),
+            "6-bit plain must be smaller than residual"
+        );
+        assert!(
+            r6 >= rr - 0.01,
+            "plain 6-bit recall {r6} must match/beats residual {rr}"
+        );
     }
 }
 
@@ -2337,6 +2512,7 @@ mod residual_tests {
             })
             .collect();
         let mut plain = VecqIndex::new(dim, 42);
+        plain.set_bits(4); // the 4-bit-vs-residual comparison from #38
         let mut resid = VecqIndex::with_residual(dim, 42);
         for v in &base {
             plain.add(v);
