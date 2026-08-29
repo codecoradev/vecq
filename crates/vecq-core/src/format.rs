@@ -20,10 +20,15 @@
 //! [keyed_entries u32][entries: slot u32 + key u64 each, slots in order]
 //! ```
 //!
-//! Readers accept v1, v1.1, v1.2 and v1.3; writers emit 1.3. The seed is
-//! stored in the header so the random sign diagonal can be regenerated
-//! identically on any platform: identical file -> identical query results,
-//! bit for bit.
+//! Version 1.4 (stored as 260): a residual-mode index (second-pass codes,
+//! issue #23). After the codes block, two extra blocks appear — f16 residual
+//! scales (`count` entries) and residual codes (`count * padded/2` bytes) —
+//! before the keyed-slot table.
+//!
+//! Readers accept v1 through v1.4; writers emit 1.3 (plain) or 1.4
+//! (residual). The seed is stored in the header so the random sign diagonal
+//! can be regenerated identically on any platform: identical file ->
+//! identical query results, bit for bit.
 
 use crate::store::VecqIndex;
 
@@ -32,6 +37,7 @@ const V1: u16 = 1;
 const V1_1: u16 = 257;
 pub const V1_2: u16 = 258;
 const V1_3: u16 = 259;
+const V1_4: u16 = 260;
 
 #[derive(Debug)]
 pub enum Error {
@@ -133,13 +139,14 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 }
 
 impl VecqIndex {
-    /// Serialize the index to bytes (format version 1.3, f16 scales).
+    /// Serialize the index to bytes. Plain indexes emit format version 1.3;
+    /// residual indexes emit 1.4 (extra residual scale + code blocks).
     ///
     /// Tombstoned slots are skipped: the output always holds the live vectors
     /// in slot order, so a round-trip through bytes has the same effect as
     /// [`VecqIndex::compact`] on disk without disturbing in-memory slot
-    /// indices. Keys of live keyed slots are stored in the v1.3 keyed-slot
-    /// table and are fully restored by [`VecqIndex::from_bytes`].
+    /// indices. Keys of live keyed slots are stored in the keyed-slot table
+    /// and are fully restored by [`VecqIndex::from_bytes`].
     pub fn to_bytes(&self) -> Vec<u8> {
         let bpv = self.padded_dim() / 2;
         let reserved: u16 = if self.working_dim() == self.dim() {
@@ -147,9 +154,16 @@ impl VecqIndex {
         } else {
             self.working_dim() as u16
         };
-        let mut out = Vec::with_capacity(24 + self.live_slots() * bpv + self.live_slots() * 2);
+        let version = if self.is_residual() { V1_4 } else { V1_3 };
+        let extra = if self.is_residual() {
+            self.live_slots() * (2 + bpv)
+        } else {
+            0
+        };
+        let mut out =
+            Vec::with_capacity(24 + self.live_slots() * bpv + self.live_slots() * 2 + extra);
         out.extend_from_slice(&MAGIC.to_le_bytes());
-        out.extend_from_slice(&V1_3.to_le_bytes());
+        out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&reserved.to_le_bytes());
         out.extend_from_slice(&(self.dim() as u32).to_le_bytes());
         out.extend_from_slice(&self.seed().to_le_bytes());
@@ -165,6 +179,20 @@ impl VecqIndex {
                 continue;
             }
             out.extend_from_slice(self.slot_codes(slot, bpv));
+        }
+        if self.is_residual() {
+            for slot in 0..self.slots() {
+                if !self.slot_alive(slot) {
+                    continue;
+                }
+                out.extend_from_slice(&f32_to_f16_bits(self.slot_scale2(slot)).to_le_bytes());
+            }
+            for slot in 0..self.slots() {
+                if !self.slot_alive(slot) {
+                    continue;
+                }
+                out.extend_from_slice(self.slot_codes2(slot, bpv));
+            }
         }
         // Keyed-slot table (v1.3): restores the keyed API across reloads.
         // Slot ids are DENSE positions among the serialized (alive) slots —
@@ -195,16 +223,17 @@ impl VecqIndex {
             return Err(Error::NotAStableFile);
         }
         let version = rd_u16(&bytes[4..6]);
-        if version != V1 && version != V1_1 && version != V1_2 && version != V1_3 {
+        if version != V1 && version != V1_1 && version != V1_2 && version != V1_3 && version != V1_4
+        {
             return Err(Error::UnsupportedVersion(version));
         }
         let dim = rd_u32(&bytes[8..12]) as usize;
         let seed = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
         let count = rd_u32(&bytes[20..24]) as usize;
 
-        // v1.2 / v1.3 carry working_dim in the reserved field (0 = full dim).
+        // v1.2+ carry working_dim in the reserved field (0 = full dim).
         let working_dim = match version {
-            V1_2 | V1_3 => match rd_u16(&bytes[6..8]) as usize {
+            V1_2 | V1_3 | V1_4 => match rd_u16(&bytes[6..8]) as usize {
                 0 => dim,
                 w if w <= dim => w,
                 w => {
@@ -242,18 +271,38 @@ impl VecqIndex {
         index.scales = scales;
         index.n = count;
         index.init_dense(count);
-        if version == V1_3 {
+        if version == V1_4 {
+            // Residual blocks: f16 scales2, then codes2.
+            index.residual = true;
+            if bytes.len() < code_end + count * (2 + codes_bytes) {
+                return Err(Error::Truncated);
+            }
+            let mut off2 = code_end;
+            for _ in 0..count {
+                index
+                    .scales2
+                    .push(f16_bits_to_f32(rd_u16(&bytes[off2..off2 + 2])));
+                off2 += 2;
+            }
+            index.codes2 = bytes[off2..off2 + count * codes_bytes].to_vec();
+        }
+        if version == V1_3 || version == V1_4 {
             // Keyed-slot table: [entries u32][slot u32 + key u64 each].
             if bytes.len() < code_end + 4 {
                 return Err(Error::Truncated);
             }
-            let entries = rd_u32(&bytes[code_end..code_end + 4]) as usize;
-            let table_end = code_end + 4 + entries * 12;
+            let key_base = if version == V1_4 {
+                code_end + count * (2 + codes_bytes)
+            } else {
+                code_end
+            };
+            let entries = rd_u32(&bytes[key_base..key_base + 4]) as usize;
+            let table_end = key_base + 4 + entries * 12;
             if bytes.len() < table_end {
                 return Err(Error::Truncated);
             }
             let mut key_table: Vec<Option<u64>> = vec![None; count];
-            let mut e = code_end + 4;
+            let mut e = key_base + 4;
             for _ in 0..entries {
                 let slot = rd_u32(&bytes[e..e + 4]) as usize;
                 let key = u64::from_le_bytes(bytes[e + 4..e + 12].try_into().unwrap());

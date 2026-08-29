@@ -121,6 +121,49 @@ therefore be evaluated as a **recall lift at the same 514 B budget** (e.g.
 the binary-signature cascade (#22) remains the scan-speed lever for larger
 n. Verdict: proceed with both, benchmarked against this baseline.
 
+## Residual quantization (issue #23)
+
+Opt-in mode (`VecqIndex::with_residual`): a second Lloyd-Max pass codes the
+residual left by the first pass; scoring adds the second term. Format v1.4
+appends the second code block per vector — readers accept v1–v3.
+
+**Estimator fix (required for the mode to help at all):** the first
+implementation divided the two-term score by the approximate norm
+`sqrt(sum_sq + rms²·padded)`. The actually-scored reconstruction is
+`x̂ = d0 + rms·d1`, whose exact norm includes the cross term `2·rms·⟨d0,d1⟩`
+(nonzero: the second-pass codes inherit the correlated quantization-error
+pattern, not an independent Gaussian) and the true quantized energy `⟨d1,d1⟩`.
+The approximation injected per-vector score distortion that *raised* score
+variance (+40% sd, bias unchanged) and flipped top-10 rankings: recall on the
+adversarial clustered set **dropped** to 0.58 vs plain 0.66 despite 4.5x
+better reconstruction MSE. Fix: compute the exact ‖x̂‖² at encode time from
+the stored code pairs and fold it into the stored scale coefficients — no
+format change, scoring kernels untouched. Same fix also restored the
+self-consistency invariant score(v, v) ≤ 1.0 (the old denominator produced
+cosine > 1.0 on some vectors).
+
+Measured after the fix, real EmbeddingGemma dataset (n=2000 + 100 queries,
+dim 768, same corpus as the table above), aarch64 release:
+
+| mode | recall@1 | recall@10 | bytes/vec | compression | scan cost |
+|---|---|---|---|---|---|
+| plain 4-bit | 0.910 | 0.958 | 514 | 5.98x | 1.00x |
+| plain + residual | **0.990** | **0.984** | 1.028 | ~3.0x | 1.43x |
+| usearch f32 HNSW | — | 0.995 | 3,072 | 1x | — |
+
+Honest labeling:
+- Residual roughly doubles the storage (second 4-bit block + second f16
+  scale) — it is a recall mode, not a free lunch. Plain stays the default.
+- The 1.43x scan cost is the second accumulate term; the cascade (#22)
+  remains the throughput lever and composes orthogonally.
+- The real-dataset comparison lives in
+  `crates/vecq-core/tests/real_residual_validation.rs` (ignored by default;
+  requires the dataset from `cto/scripts/gen_embeddings.py`). Re-run it in
+  release before merging any estimator/format change.
+- Plain-path numbers are unchanged by the fix by construction (single-term
+  path untouched); re-verified: `real`/`vs_usearch`/`vs_quantizers` recall
+  bit-identical to the baseline tables above.
+
 ## Conclusion
 
 The spike validates the technique: training-free 4-bit RHDH + Lloyd-Max
