@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - Configurable Lloyd-Max width: `VecqIndex::set_bits(4|5|6)` with **5-bit default** — the compression/recall sweet spot (4.78x, recall@10 0.979 on real data). 4-bit stays available for maximum squeeze + cascade; 6-bit reaches residual-class recall at 25% less storage. File format v1.5 (width byte, plain non-4-bit only); 4-bit and residual outputs stay byte-identical (#39)
 - Opt-in residual quantization: `VecqIndex::with_residual`, two-pass 4-bit codes, exact-norm two-term scoring, format v1.4 (#23)
+- Zero-copy read-only views: `VecqView::from_bytes` parses any byte owner (mmap, `Vec<u8>`, …) without copying payloads — map+parse ~64 µs vs 4.9 ms full load at 12k vectors, results bit-identical to the loaded index (#25)
 
 ### Changed
 - NEON batch kernel for 5/6-bit scoring (u64-window extraction + LUT gather), bit-identical to the scalar reference; 5-bit scan 4.27 → 3.21 ms/q (#40)

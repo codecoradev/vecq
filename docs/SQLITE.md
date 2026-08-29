@@ -101,14 +101,17 @@ O(n) over the live vectors.
 
 ## Size and latency
 
-Bytes per vector = `padded_dim/2 + 2` (nibble codes + f16 scale, format v1.1).
-For dim 768 (padded 1024): **514 B/vector**.
+Bytes per vector = `ceil(padded_dim * bits / 8) + 2` (codes + f16 scale;
+width 4/5/6-bit, default 5 — `VecqView` parses the same bytes zero-copy for
+read-only serving).
+For dim 768 (padded 1024): **642 B/vector** at the 5-bit default, 514 B at
+4-bit, 770 B at 6-bit; residual adds a second code block (1,028 B at 4-bit).
 
 | vectors | dim 768 BLOB | save (update+commit) | load (read BLOB) |
 |---|---|---|---|
-| 1,000 | 0.5 MB | ~0.3 ms | ~0.1 ms |
-| 10,000 | 5.0 MB | ~2 ms | ~3 ms |
-| 50,000 | 25 MB | ~28 ms | ~10 ms |
+| 1,000 | 0.6 MB | ~0.3 ms | ~0.1 ms |
+| 10,000 | 6.4 MB | ~2 ms | ~3 ms |
+| 50,000 | 32 MB | ~28 ms | ~10 ms |
 
 Measured on an M-series MacBook (Python `sqlite3`, WAL, `synchronous=NORMAL`)
 — treat as order-of-magnitude for commodity hardware. The point: for the
