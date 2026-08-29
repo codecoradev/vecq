@@ -892,31 +892,30 @@ impl VecqIndex {
         {
             // Batch 4 vectors per pass: shared q loads + LUT setup. Tombstoned
             // slots are still scored (keeping the batch dense) but filtered
-            // before entering the heap. NEON batch kernels are 4-bit-only;
-            // wider widths fall through to the scalar loop below.
-            if self.bits == 4 {
-                while idx + 4 <= self.n {
-                    let codes4 = &self.codes[idx * bpv..(idx + 4) * bpv];
-                    let raw = unsafe { neon::score_neon4(codes4, q_rot, &pq.lut) };
-                    let raw1 = if self.residual {
-                        Some(unsafe {
-                            neon::score_neon4(
-                                &self.codes2[idx * bpv..(idx + 4) * bpv],
-                                q_rot,
-                                &pq.lut,
-                            )
-                        })
-                    } else {
-                        None
-                    };
-                    for (v, &r) in raw.iter().enumerate() {
-                        let si = idx + v;
-                        if self.alive[si] {
-                            consider(combine(r, raw1.map(|a| a[v]), si), si, &mut heap);
-                        }
+            // before entering the heap. NEON batch kernels: 4-bit LUT path
+            // and 5/6-bit wide path (#40); residual rescore stays narrow
+            // (residual indexes are 4-bit by construction).
+            while idx + 4 <= self.n {
+                let codes4 = &self.codes[idx * bpv..(idx + 4) * bpv];
+                let raw: [f32; 4] = if self.bits == 4 {
+                    unsafe { neon::score_neon4(codes4, q_rot, &pq.lut) }
+                } else {
+                    unsafe { neon::score_neon_wide4(codes4, q_rot, self.bits) }
+                };
+                let raw1 = if self.residual {
+                    Some(unsafe {
+                        neon::score_neon4(&self.codes2[idx * bpv..(idx + 4) * bpv], q_rot, &pq.lut)
+                    })
+                } else {
+                    None
+                };
+                for (v, &r) in raw.iter().enumerate() {
+                    let si = idx + v;
+                    if self.alive[si] {
+                        consider(combine(r, raw1.map(|a| a[v]), si), si, &mut heap);
                     }
-                    idx += 4;
                 }
+                idx += 4;
             }
         }
         #[cfg(target_arch = "x86_64")]
@@ -1013,12 +1012,17 @@ fn unpack_code(bytes: &[u8], i: usize, bits: u8) -> u8 {
 /// this path is single-pass like `score_scalar`, just with wider codes.
 fn score_wide_scalar(codes: &[u8], q: &[f32], bits: u8) -> f32 {
     let centroids = lloyd::centroids(bits);
-    let mut sum = 0f32;
+    // 4-lane bucket accumulation (lane j takes dims j, j+4, j+8, ...) with a
+    // fixed pairwise tree — the exact order the NEON wide kernel replicates,
+    // mirroring the score_scalar/score_neon pairing at 4-bit.
+    let mut acc = [0f32; 4];
     for (i, &qi) in q.iter().enumerate() {
         let c = unpack_code(codes, i, bits) as usize;
-        sum += qi * centroids[c];
+        acc[i & 3] += qi * centroids[c];
     }
-    sum
+    let s01 = acc[0] + acc[1];
+    let s23 = acc[2] + acc[3];
+    s01 + s23
 }
 
 /// Reference 8-bucket scalar scoring. Bucket j accumulates byte j, j+8, ...
@@ -1238,6 +1242,85 @@ mod neon {
             let s45 = a[4] + a[5];
             let s67 = a[6] + a[7];
             out[v] = (s01 + s23) + (s45 + s67) + tail;
+        }
+        out
+    }
+
+    /// Batch-4 NEON scoring for 5/6-bit codes (#40). Bit-identity with
+    /// [`score_wide_scalar`] is structural: every dimension d contributes
+    /// `q[d] * centroids[code_d]` to lane `d & 3` of its vector's
+    /// accumulator, dims in increasing order, reduced with the same
+    /// pairwise tree (tail dims included in the lanes before reducing).
+    ///
+    /// Extraction reads one unaligned u64 window per 8 dims — 8*w+7 <= 62
+    /// bits always fits for both widths — replacing 8 per-dim `unpack_code`
+    /// calls with shifts on two registers. Centroids are gathered through
+    /// L1 (the 128/256-byte table stays hot); NEON `vqtbl` cannot address
+    /// tables that wide, and a range-split costs more ops than the scalar
+    /// gathers it replaces — measured, not guessed (#40 notes).
+    ///
+    /// Residual indexes never reach this kernel: they are 4-bit-only.
+    pub unsafe fn score_neon_wide4(codes4: &[u8], q: &[f32], bits: u8) -> [f32; 4] {
+        debug_assert!(matches!(bits, 5..=6));
+        use super::unpack_code;
+        let centroids = crate::lloyd::centroids(bits);
+        let nb = codes4.len() / 4;
+        let n_dims = nb * 8 / bits as usize; // == padded (WHT pads to pow2)
+        let w = bits as u64;
+        let mask = (1u64 << w) - 1;
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        let mut i = 0;
+        while i + 8 <= n_dims {
+            for v in 0..4 {
+                let base = v * nb;
+                let b0 = i * bits as usize;
+                let off = base + b0 / 8;
+                // Only the bits [b0, b0 + 8*w) matter: ceil((s0+8w)/8) <= 7
+                // bytes. Loading a fixed 8-byte u64 would run past the end
+                // of the last vector's block.
+                let need = (b0 % 8 + 8 * bits as usize + 7) / 8;
+                let mut wb = [0u8; 8];
+                wb[..need].copy_from_slice(&codes4[off..off + need]);
+                let win = u64::from_le_bytes(wb);
+                let s0 = (b0 % 8) as u64;
+                let mut g = [0f32; 8];
+                for l in 0..8usize {
+                    let c = ((win >> (s0 + l as u64 * w)) & mask) as usize;
+                    debug_assert_eq!(c, unpack_code(&codes4[base..], i + l, bits) as usize);
+                    g[l] = centroids[c];
+                }
+                let gv = vld1q_f32(g.as_ptr());
+                let gv2 = vld1q_f32(g.as_ptr().add(4));
+                let qv = vld1q_f32(q.as_ptr().add(i));
+                let qv2 = vld1q_f32(q.as_ptr().add(i + 4));
+                acc[v] = vaddq_f32(acc[v], vmulq_f32(qv, gv));
+                acc[v] = vaddq_f32(acc[v], vmulq_f32(qv2, gv2));
+            }
+            i += 8;
+        }
+        // Extract lane accumulators, fold remaining tail dims into the same
+        // lane order the scalar reference uses, then pairwise-reduce.
+        let mut lanes = [[0f32; 4]; 4];
+        for v in 0..4 {
+            lanes[v] = [
+                vgetq_lane_f32(acc[v], 0),
+                vgetq_lane_f32(acc[v], 1),
+                vgetq_lane_f32(acc[v], 2),
+                vgetq_lane_f32(acc[v], 3),
+            ];
+        }
+        while i < n_dims {
+            for v in 0..4 {
+                let c = unpack_code(&codes4[v * nb..], i, bits) as usize;
+                lanes[v][i & 3] += q[i] * centroids[c];
+            }
+            i += 1;
+        }
+        let mut out = [0f32; 4];
+        for v in 0..4 {
+            let s01 = lanes[v][0] + lanes[v][1];
+            let s23 = lanes[v][2] + lanes[v][3];
+            out[v] = s01 + s23;
         }
         out
     }
@@ -1506,6 +1589,7 @@ mod tests {
     fn neon4_matches_neon_bitwise() {
         let dim = 128;
         let mut idx = VecqIndex::new(dim, 91);
+        idx.set_bits(4); // this test exercises the 4-bit kernels specifically
         for i in 0..12 {
             idx.add(&rand_unit(dim, i + 90));
         }
@@ -1526,6 +1610,40 @@ mod tests {
                         single.to_bits(),
                         "chunk {chunk_start} vec {v}: neon4 diverged from neon"
                     );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_wide_matches_scalar_bitwise() {
+        // The #40 wide kernel must be bit-identical to score_wide_scalar for
+        // every 5/6-bit vector, including per-vector batch boundaries and
+        // padded tail dims.
+        for bits in [5u8, 6] {
+            for dim in [128usize, 384] {
+                let mut idx = VecqIndex::new(dim, 91);
+                idx.set_bits(bits);
+                for i in 0..12 {
+                    idx.add(&rand_unit(dim, i + 90));
+                }
+                let q = rand_unit(dim, 1234);
+                let pq = idx.prepare_query(&q);
+                let bpv = idx.bytes_per_vector();
+                for chunk_start in (0..12).step_by(4) {
+                    let codes4 = &idx.codes[chunk_start * bpv..(chunk_start + 4) * bpv];
+                    let qslice = &pq.rotated[..idx.padded()];
+                    let batched = unsafe { neon::score_neon_wide4(codes4, qslice, bits) };
+                    for v in 0..4 {
+                        let scalar =
+                            score_wide_scalar(&codes4[v * bpv..(v + 1) * bpv], qslice, bits);
+                        assert_eq!(
+                            batched[v].to_bits(),
+                            scalar.to_bits(),
+                            "bits {bits} dim {dim} chunk {chunk_start} vec {v}"
+                        );
+                    }
                 }
             }
         }
