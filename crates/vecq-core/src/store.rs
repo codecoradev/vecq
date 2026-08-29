@@ -1595,20 +1595,31 @@ mod tests {
     #[test]
     fn search_dispatch_matches_scalar_on_avx2_hosts() {
         // Whatever path dispatch picks, results must equal the scalar
-        // reference bit for bit.
+        // reference bit for bit — at every width.
         let dim = 128;
-        let mut idx = VecqIndex::new(dim, 55);
-        for i in 0..30 {
-            idx.add(&rand_unit(dim, i + 800));
-        }
-        let q = rand_unit(dim, 888);
-        let pq = idx.prepare_query(&q);
-        for vi in 0..30 {
-            let base = vi * (idx.padded() / 2);
-            let codes = &idx.codes[base..base + idx.padded() / 2];
-            let qslice = &pq.rotated[..idx.padded()];
-            let scalar = score_scalar(codes, qslice, &pq.lut) * idx.scales[vi];
-            assert_eq!(idx.score(&pq, vi).to_bits(), scalar.to_bits());
+        for bits in [4u8, 5, 6] {
+            let mut idx = VecqIndex::new(dim, 55);
+            idx.set_bits(bits);
+            for i in 0..30 {
+                idx.add(&rand_unit(dim, i + 800));
+            }
+            let q = rand_unit(dim, 888);
+            let pq = idx.prepare_query(&q);
+            for vi in 0..30 {
+                let base = vi * idx.bytes_per_vector();
+                let codes = &idx.codes[base..base + idx.bytes_per_vector()];
+                let qslice = &pq.rotated[..idx.padded()];
+                let scalar = if bits == 4 {
+                    score_scalar(codes, qslice, &pq.lut)
+                } else {
+                    score_wide_scalar(codes, qslice, bits)
+                };
+                assert_eq!(
+                    idx.score(&pq, vi).to_bits(),
+                    (scalar * idx.scales[vi]).to_bits(),
+                    "bits {bits} vec {vi}"
+                );
+            }
         }
     }
 
