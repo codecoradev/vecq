@@ -33,13 +33,13 @@
 
 use crate::store::VecqIndex;
 
-const MAGIC: u32 = u32::from_le_bytes(*b"VECQ");
+pub(crate) const MAGIC: u32 = u32::from_le_bytes(*b"VECQ");
 const V1: u16 = 1;
 const V1_1: u16 = 257;
 pub const V1_2: u16 = 258;
-const V1_3: u16 = 259;
-const V1_4: u16 = 260;
-const V1_5: u16 = 261;
+pub(crate) const V1_3: u16 = 259;
+pub(crate) const V1_4: u16 = 260;
+pub(crate) const V1_5: u16 = 261;
 
 #[derive(Debug)]
 pub enum Error {
@@ -118,7 +118,7 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 }
 
 /// IEEE 754 half-precision decode.
-fn f16_bits_to_f32(h: u16) -> f32 {
+pub(crate) fn f16_bits_to_f32(h: u16) -> f32 {
     let sign = ((h & 0x8000) as u32) << 16;
     let exp = ((h >> 10) & 0x1F) as u32;
     let mant = (h & 0x03FF) as u32;

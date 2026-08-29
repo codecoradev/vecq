@@ -131,3 +131,29 @@ batch" is comfortably fast, and per-shard rows are only worth it past ~50 MB.
   `VACUUM` slow; another reason for the ~100 MB embed threshold.
 - **Seed discipline**: always store `seed` next to the BLOB; a rebuilt index
   with a different seed produces a different rotation and incompatible scores.
+
+## When to skip the BLOB: zero-copy mmap views (#25)
+
+For read-only serving of large indexes, skip the BLOB *and* the full load:
+`VecqView::from_bytes` parses any owner of the file bytes — including a
+`memmap2::Mmap` — with zero copying of codes/scales. Measured on the
+12k-vector reference dataset (5-bit, 7.7 MB file, aarch64 release):
+map+parse ready in **~64 µs vs 4.9 ms** for read+parse+copy (~76x faster
+time-to-ready), then identical warm search throughput (same batched
+kernels; results bit-identical to `VecqIndex::from_bytes`, tested).
+
+```rust
+use memmap2::Mmap; // bench/example-only dep; vecq-core stays dependency-free
+use vecq_core::VecqView;
+
+let file = std::fs::File::open("index.vecq")?;
+let map = unsafe { Mmap::map(&file)? };
+let view = VecqView::from_bytes(&map)?;
+let hits = view.search(&query, 10); // (slot, score), same as the loaded index
+```
+
+Choose by workload: BLOB-in-SQLite for mutable, transactional, embedded
+storage (this document); `VecqView` over an mmap'd file for large read-only
+deployments and cold-start-sensitive serving. Views are dense (tombstones
+are dropped on save) and carry no keyed map — persist keys separately if
+you need the keyed layer on a read-only view.
