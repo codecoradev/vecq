@@ -9,7 +9,7 @@ Spike results, measured on aarch64 (Oracle ARM host), single-threaded, release p
   18 topics × 10 modifiers (structured paragraphs, memory-note style)
 - Ground truth: exact f32 cosine brute-force
 - Competitor: usearch v2.26.1 (HNSW, f32, MetricKind::Cos)
-- vecq format v1.1 (f16 scales, 2 B/vector)
+- vecq file format v1.5 (width byte); the index under test uses the 5-bit default
 
 ## Results
 
