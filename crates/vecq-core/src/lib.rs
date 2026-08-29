@@ -10,5 +10,7 @@ pub mod format;
 pub mod lloyd;
 pub mod rhdh;
 pub mod store;
+pub mod view;
 
 pub use store::{cosine_f32, PreparedQuery, VecqIndex};
+pub use view::VecqView;

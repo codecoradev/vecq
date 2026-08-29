@@ -801,27 +801,7 @@ impl VecqIndex {
     /// the best available kernel for the target.
     #[inline]
     fn score_raw(&self, codes: &[u8], q: &[f32], lut: &[f32; 16], bits: u8) -> f32 {
-        if bits != 4 {
-            return score_wide_scalar(codes, q, bits);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            // NEON is baseline on aarch64.
-            unsafe { neon::score_neon(codes, q, lut) }
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            if avx2::available() {
-                // SAFETY: feature availability checked immediately above.
-                unsafe { avx2::score_avx2(codes, q, lut) }
-            } else {
-                score_scalar(codes, q, lut)
-            }
-        }
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        {
-            score_scalar(codes, q, lut)
-        }
+        score_raw_dispatch(codes, q, lut, bits)
     }
 
     /// Brute-force top-k search. Returns (slot index, score) sorted by score
@@ -971,6 +951,71 @@ impl VecqIndex {
             .collect();
         out.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("no NaN scores"));
         out
+    }
+}
+
+/// Batch-4 scoring over raw code slices, shared by the index search loop
+/// and the zero-copy view (issue #25): both must hit the same kernels with
+/// the same association order. 4-bit uses the nibble-LUT kernels; 5/6-bit
+/// uses the wide kernel; residual planes are 4-bit by construction.
+pub(crate) fn score_batch4(codes4: &[u8], q_rot: &[f32], lut: &[f32; 16], bits: u8) -> [f32; 4] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if bits == 4 {
+            // SAFETY: NEON is baseline on aarch64.
+            return unsafe { neon::score_neon4(codes4, q_rot, lut) };
+        }
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { neon::score_neon_wide4(codes4, q_rot, bits) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2::available() && bits == 4 {
+            // SAFETY: feature availability checked immediately above.
+            return unsafe { avx2::score_avx24(codes4, q_rot, lut) };
+        }
+        let nb = codes4.len() / 4;
+        let mut out = [0f32; 4];
+        for v in 0..4 {
+            out[v] = score_raw_dispatch(&codes4[v * nb..(v + 1) * nb], q_rot, lut, bits);
+        }
+        out
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let nb = codes4.len() / 4;
+        let mut out = [0f32; 4];
+        for v in 0..4 {
+            out[v] = score_raw_dispatch(&codes4[v * nb..(v + 1) * nb], q_rot, lut, bits);
+        }
+        out
+    }
+}
+
+/// Free-function kernel dispatch shared by [`VecqIndex`] and the zero-copy
+/// [`crate::view::VecqView`] — one place guarantees both owners pick the
+/// same kernel with the same association order (bit-identity).
+pub(crate) fn score_raw_dispatch(codes: &[u8], q: &[f32], lut: &[f32; 16], bits: u8) -> f32 {
+    if bits != 4 {
+        return score_wide_scalar(codes, q, bits);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is baseline on aarch64.
+        unsafe { neon::score_neon(codes, q, lut) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2::available() {
+            // SAFETY: feature availability checked immediately above.
+            unsafe { avx2::score_avx2(codes, q, lut) }
+        } else {
+            score_scalar(codes, q, lut)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        score_scalar(codes, q, lut)
     }
 }
 
@@ -1271,6 +1316,7 @@ mod neon {
         let mut acc = [vdupq_n_f32(0.0); 4];
         let mut i = 0;
         while i + 8 <= n_dims {
+            #[allow(clippy::needless_range_loop)] // v is both a vector index and the acc lane
             for v in 0..4 {
                 let base = v * nb;
                 let b0 = i * bits as usize;
@@ -1278,12 +1324,13 @@ mod neon {
                 // Only the bits [b0, b0 + 8*w) matter: ceil((s0+8w)/8) <= 7
                 // bytes. Loading a fixed 8-byte u64 would run past the end
                 // of the last vector's block.
-                let need = (b0 % 8 + 8 * bits as usize + 7) / 8;
+                let need = (b0 % 8 + 8 * bits as usize).div_ceil(8);
                 let mut wb = [0u8; 8];
                 wb[..need].copy_from_slice(&codes4[off..off + need]);
                 let win = u64::from_le_bytes(wb);
                 let s0 = (b0 % 8) as u64;
                 let mut g = [0f32; 8];
+                #[allow(clippy::needless_range_loop)] // l indexes g and feeds the shift math
                 for l in 0..8usize {
                     let c = ((win >> (s0 + l as u64 * w)) & mask) as usize;
                     debug_assert_eq!(c, unpack_code(&codes4[base..], i + l, bits) as usize);
