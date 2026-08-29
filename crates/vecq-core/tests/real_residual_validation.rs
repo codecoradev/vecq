@@ -8,10 +8,9 @@ use vecq_core::VecqIndex;
 
 fn read_f32s(path: &str) -> Vec<f32> {
     let bytes = std::fs::read(path).expect(path);
-    bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
+    let (chunks, rest) = bytes.as_chunks::<4>();
+    assert!(rest.is_empty(), "{path}: size not a multiple of 4");
+    chunks.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
