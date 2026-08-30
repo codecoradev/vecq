@@ -126,7 +126,7 @@ Default width (5-bit), aarch64, single-threaded, 2,000 real EmbeddingGemma vecto
 
 ## Status
 
-`v0.x` — file formats v1.2–v1.5 documented and frozen, readers accept v1–v1.5; the library API is stable on the `VecqIndex` path, with `VecqView` for read-only zero-copy serving. crates.io publication is prepared (`cargo package` passes) and will follow once the v0.x API settles.
+`v0.x` — file formats v1.2–v1.5 documented and frozen, readers accept v1–v1.5; the library API is stable on the `VecqIndex` path, with `VecqView` for read-only zero-copy serving. Published on crates.io as [`vecq-core`](https://crates.io/crates/vecq-core).
 
 ## License
 
