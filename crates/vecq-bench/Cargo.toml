@@ -10,10 +10,20 @@ authors.workspace = true
 [dependencies]
 usearch = "2.26.1"
 vecq-core = { path = "../vecq-core" }
+# Competitor quantizers for the head-to-head harness (bin/vs_quantizers).
+# Bench-only deps: vecq-core itself remains zero-dependency.
+turboquant = "0.1"
+rabitq-rs = "0.9"
+# mmap cold-start harness (bin/view_mmap) — core stays dependency-free.
+memmap2 = "0.9"
 
 [[bin]]
 name = "vecq-bench"
 path = "src/main.rs"
+
+[[bin]]
+name = "vs_quantizers"
+path = "src/bin/vs_quantizers.rs"
 
 [dev-dependencies]
 usearch = "2.26.1"

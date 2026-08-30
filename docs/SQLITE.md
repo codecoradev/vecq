@@ -42,20 +42,13 @@ CREATE TABLE vecq_shard (
 );
 ```
 
-Keys from the keyed API (`add_keyed`/`remove_keyed`) are **not** part of the
-file format — persist your own mapping table next to the index:
-
-```sql
-CREATE TABLE vecq_keys (
-    key  INTEGER PRIMARY KEY,       -- the u64 key used in add_keyed()
-    slot INTEGER NOT NULL           -- slot index, valid until compact()
-);
-```
-
-Because `to_bytes()` drops tombstones and re-serializes live slots in order,
-**slot indices change whenever you save-then-reload after a `compact()`** —
-rewrite `vecq_keys` in the same transaction whenever you save the index (see
-below), or simply resolve keys → search results instead of storing slots.
+Keys from the keyed API (`add_keyed`/`remove_keyed`) are **part of the file
+format since v1.3**: `to_bytes()` stores them and `from_bytes()` restores the
+keyed map, so a save/reload round-trip keeps `search_keyed`/`remove_keyed`
+working. Slot indices change whenever you save-then-reload after a
+`compact()` (the file always stores live slots densely) — rewrite
+`vecq_keys` in the same transaction whenever you save the index, or simply
+resolve keys → search results instead of storing slots.
 
 ## Canonical save/load (Rust + rusqlite)
 
@@ -108,14 +101,17 @@ O(n) over the live vectors.
 
 ## Size and latency
 
-Bytes per vector = `padded_dim/2 + 2` (nibble codes + f16 scale, format v1.1).
-For dim 768 (padded 1024): **514 B/vector**.
+Bytes per vector = `ceil(padded_dim * bits / 8) + 2` (codes + f16 scale;
+width 4/5/6-bit, default 5 — `VecqView` parses the same bytes zero-copy for
+read-only serving).
+For dim 768 (padded 1024): **642 B/vector** at the 5-bit default, 514 B at
+4-bit, 770 B at 6-bit; residual adds a second code block (1,028 B at 4-bit).
 
 | vectors | dim 768 BLOB | save (update+commit) | load (read BLOB) |
 |---|---|---|---|
-| 1,000 | 0.5 MB | ~0.3 ms | ~0.1 ms |
-| 10,000 | 5.0 MB | ~2 ms | ~3 ms |
-| 50,000 | 25 MB | ~28 ms | ~10 ms |
+| 1,000 | 0.6 MB | ~0.3 ms | ~0.1 ms |
+| 10,000 | 6.4 MB | ~2 ms | ~3 ms |
+| 50,000 | 32 MB | ~28 ms | ~10 ms |
 
 Measured on an M-series MacBook (Python `sqlite3`, WAL, `synchronous=NORMAL`)
 — treat as order-of-magnitude for commodity hardware. The point: for the
@@ -138,3 +134,29 @@ batch" is comfortably fast, and per-shard rows are only worth it past ~50 MB.
   `VACUUM` slow; another reason for the ~100 MB embed threshold.
 - **Seed discipline**: always store `seed` next to the BLOB; a rebuilt index
   with a different seed produces a different rotation and incompatible scores.
+
+## When to skip the BLOB: zero-copy mmap views (#25)
+
+For read-only serving of large indexes, skip the BLOB *and* the full load:
+`VecqView::from_bytes` parses any owner of the file bytes — including a
+`memmap2::Mmap` — with zero copying of codes/scales. Measured on the
+12k-vector reference dataset (5-bit, 7.7 MB file, aarch64 release):
+map+parse ready in **~64 µs vs 4.9 ms** for read+parse+copy (~76x faster
+time-to-ready), then identical warm search throughput (same batched
+kernels; results bit-identical to `VecqIndex::from_bytes`, tested).
+
+```rust
+use memmap2::Mmap; // bench/example-only dep; vecq-core stays dependency-free
+use vecq_core::VecqView;
+
+let file = std::fs::File::open("index.vecq")?;
+let map = unsafe { Mmap::map(&file)? };
+let view = VecqView::from_bytes(&map)?;
+let hits = view.search(&query, 10); // (slot, score), same as the loaded index
+```
+
+Choose by workload: BLOB-in-SQLite for mutable, transactional, embedded
+storage (this document); `VecqView` over an mmap'd file for large read-only
+deployments and cold-start-sensitive serving. Views are dense (tombstones
+are dropped on save) and carry no keyed map — persist keys separately if
+you need the keyed layer on a read-only view.
