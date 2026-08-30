@@ -9,17 +9,37 @@ Spike results, measured on aarch64 (Oracle ARM host), single-threaded, release p
   18 topics × 10 modifiers (structured paragraphs, memory-note style)
 - Ground truth: exact f32 cosine brute-force
 - Competitor: usearch v2.26.1 (HNSW, f32, MetricKind::Cos)
-- vecq format v1.1 (f16 scales, 2 B/vector)
+- vecq file format v1.5 (width byte); the index under test uses the 5-bit default
 
 ## Results
 
 | engine | build | ms/query | recall@10 | bytes/vector | compression |
 |---|---|---|---|---|---|
-| vecq 4-bit | 64 ms | 0.89 | **0.961** | **514** | **5.98x** vs f32 |
+| vecq 5-bit (default) | 75 ms | 3.21 | **0.979** | 642 | **4.78x** vs f32 |
+| vecq 4-bit | 64 ms | 0.89 | 0.958 | 514 | 5.98x vs f32 |
 | usearch f32 (HNSW) | 893 ms | 0.23 | 0.995 | 3,072 | 1x |
 | f32 brute force | — | 1.12 | 1.000 (ref) | 3,072 | 1x |
 
-Recall@1 = 0.910. Recall gate for the spike was **≥ 0.95** → **passed**.
+Recall@1 = 0.970 (default) / 0.910 (4-bit). Recall gate for the spike was **≥ 0.95** → **passed** (both widths).
+
+## Width matrix (#39/#40, Aug 2026)
+
+All modes on the same dataset, aarch64 release, post wide-kernel:
+
+| mode | recall@1 | recall@10 | bytes/vec | compression | ms/q |
+|---|---|---|---|---|---|
+| plain 4-bit | 0.910 | 0.958 | 514 | 5.98x | 0.89 |
+| plain 5-bit (default) | 0.970 | 0.979 | 642 | 4.78x | 3.21 |
+| plain 6-bit | 0.960 | 0.980 | 770 | 3.99x | 3.24 |
+| plain 4-bit + residual | **0.990** | **0.984** | 1,028 | 2.99x | 1.76 |
+
+- Default is the compression/recall sweet spot; 6-bit matches residual-class
+  recall at 25% less storage; residual is the recall mode and — while 5/6-bit
+  scoring is extraction-bound — also the fastest high-recall option.
+- 5/6-bit latency ceiling: `vqtbl` cannot address 128/256-byte centroid
+  tables, so vector gather needs a range-split (≈2–3x the 4-bit gather cost).
+  Split-layout codes (separate nibble/high-bit streams) project only
+  ~2.2–2.7 ms/q — tracked with the full analysis in issue #40.
 
 ## Changelog vs first spike measurement
 
@@ -33,8 +53,9 @@ Recall@1 = 0.910. Recall gate for the spike was **≥ 0.95** → **passed**.
 ## Analysis
 
 ### What vecq wins
-- **Memory**: 514 B/vector vs 3,072 B — a **5.98x** reduction with no training.
-  A 300 MB f32 index projects to ~50 MB (e.g. a 768-dim index of ~100k memories).
+- **Memory**: 642 B/vector at default width vs 3,072 B — a **4.78x** reduction
+  with no training (5.98x at 4-bit). A 300 MB f32 index projects to ~63 MB
+  (e.g. a 768-dim index of ~100k memories).
 - **Build time**: 14x faster than usearch HNSW construction (64 ms vs 893 ms) —
   no graph to build, just quantize.
 - **Determinism**: fixed-order accumulation over packed codes; same file →
@@ -43,14 +64,16 @@ Recall@1 = 0.910. Recall gate for the spike was **≥ 0.95** → **passed**.
 - **Zero dependencies** in the core quantization path.
 
 ### What vecq loses (expected)
-- **Search throughput**: 8x slower than HNSW at n=2,000 (0.89 vs 0.23 ms/q).
-  This is the documented brute-force vs graph trade-off and matches the
-  MonaVec finding (2–14x slower than usearch/hnswlib). On-device with n ≤ ~10k
-  and battery/thermal constraints, sub-2 ms/query is already interactive.
+- **Search throughput**: 14x slower than HNSW at default width (3.21 vs
+  0.23 ms/q); the 4-bit width closes it to 4x (0.89). This is the documented
+  brute-force vs graph trade-off and matches the MonaVec finding (2–14x
+  slower than usearch/hnswlib). On-device with n ≤ ~10k and battery/thermal
+  constraints, sub-2 ms/query (4-bit, residual) is already interactive.
 
 ### Known limitations
-- Explicit NEON intrinsics (tbl-based nibble LUT gather) is the next
-  throughput lever; the current gain comes from auto-vectorization only.
+- 5/6-bit scoring is extraction-bound on aarch64 (3.2 ms/q vs 0.89 at 4-bit);
+  the remaining lever (split-layout codes) has a bounded ceiling — see the
+  width matrix above and issue #40.
 - Search is O(n) brute force; no ANN graph on top of the codes yet.
 - f16 scales perturb scores by <1e-3; ranking ties near the cutoff can shift
   by one position (covered by tests: top-10 overlap ≥ 9/10, top-1 unchanged).
@@ -61,6 +84,11 @@ All paths produce **bit-identical scores** (same association order, no FMA
 contraction); a unit test enforces AVX2 == scalar and NEON == scalar on
 overlapping inputs. `search()` additionally batches 4 vectors per pass on
 both SIMD paths.
+
+> **Format note:** writers emit format v1.3 — v1.2 added the Matryoshka
+> `working_dim` header field (issue #24), v1.3 appends a keyed-slot table so
+> keyed APIs survive save/reload (issue #32). Readers accept v1, v1.1, v1.2
+> and v1.3.
 
 | architecture | path | selection |
 |---|---|---|
@@ -76,11 +104,95 @@ bound). Rosetta-emulated runs are explicitly **not** used as x86_64
 benchmarks — Rosetta neither advertises AVX2 via CPUID nor reflects native
 throughput.
 
+## Head-to-head vs other 4-bit quantizers (issue #28)
+
+Harness: `cargo run -p vecq-bench --release --bin vs_quantizers` — identical
+synthetic clustered dataset for every engine (n=10k/1k, 200 queries), exact
+f32 cosine ground truth, aarch64 (Apple Silicon) single-threaded, release.
+Recall numbers are deterministic across runs; timings vary ~±20%.
+
+| dataset | engine | bytes/vec | build ms | ms/query | recall@10 |
+|---|---|---|---|---|---|
+| n=10k, dim=768 | f32 brute (ref) | 3072 | — | 8.9 | 1.000 |
+| | **vecq 4-bit** | 514 | **94** | **2.1–2.7** | **0.840** |
+| | TurboQuant-MSE 4-bit (SDC) | 384 | 1080 | 15.0–15.7 | 0.798 |
+| | RaBitQ 4-bit brute (FHT-Kac) | 392 | 185–250 | 37.9–39.3 | 0.827 |
+| n=10k, dim=384 | **vecq 4-bit** | 258 | **41** | **~1.0** | **0.846** |
+| | TurboQuant-MSE 4-bit (SDC) | 192 | ~270 | 7.3–9.0 | 0.813 |
+| | RaBitQ 4-bit brute (FHT-Kac) | 200 | 85–100 | 18.6–29.4 | 0.843 |
+| n=1k, dim=384 | **vecq 4-bit** | 258 | 7 | **0.19–0.34** | **0.875** |
+| | TurboQuant-MSE 4-bit (SDC) | 192 | ~275 | ~1.1 | 0.844 |
+| | RaBitQ 4-bit brute (FHT-Kac) | 200 | 18 | ~2.3 | 0.873 |
+
+Methodology notes (honest labeling):
+- Recall is **not** comparable to the 0.958 EmbeddingGemma table above — this
+  dataset is the harder synthetic clustered set used by `vecq-bench`.
+- vecq scans 4-bit codes with the explicit NEON kernel + 4-vector batching.
+- TurboQuant-MSE: symmetric distance computation (both query and database in
+  the shared Lloyd-Max codebook domain) — the crate exposes no ADC path or
+  rotation accessor; codebook bytes are excluded from bytes/vec.
+- RaBitQ: `rabitq-rs` 0.9 brute-force index as implemented (train uses its
+  internal rayon pool); bytes/vec = 4-bit codes + two per-vector f32 norms.
+- vecq bytes/vec include the per-vector f16 scale and power-of-two padding
+  (768 → 1024, a ~25% padding tax the competitors don't pay).
+- x86_64 numbers pending native measurement (see scoring-path table).
+
+**Go/no-go for follow-ups:** vecq already leads both competitors on scan
+speed (5–14x) and recall at dim 768. Residual quantization (#23) should
+therefore be evaluated as a **recall lift at the same 514 B budget** (e.g.
+4-bit + residual at equal total bytes vs the competitors' plain 4-bit), and
+the binary-signature cascade (#22) remains the scan-speed lever for larger
+n. Verdict: proceed with both, benchmarked against this baseline.
+
+## Residual quantization (issue #23)
+
+Opt-in mode (`VecqIndex::with_residual`): a second Lloyd-Max pass codes the
+residual left by the first pass; scoring adds the second term. Format v1.4
+appends the second code block per vector — readers accept v1–v3.
+
+**Estimator fix (required for the mode to help at all):** the first
+implementation divided the two-term score by the approximate norm
+`sqrt(sum_sq + rms²·padded)`. The actually-scored reconstruction is
+`x̂ = d0 + rms·d1`, whose exact norm includes the cross term `2·rms·⟨d0,d1⟩`
+(nonzero: the second-pass codes inherit the correlated quantization-error
+pattern, not an independent Gaussian) and the true quantized energy `⟨d1,d1⟩`.
+The approximation injected per-vector score distortion that *raised* score
+variance (+40% sd, bias unchanged) and flipped top-10 rankings: recall on the
+adversarial clustered set **dropped** to 0.58 vs plain 0.66 despite 4.5x
+better reconstruction MSE. Fix: compute the exact ‖x̂‖² at encode time from
+the stored code pairs and fold it into the stored scale coefficients — no
+format change, scoring kernels untouched. Same fix also restored the
+self-consistency invariant score(v, v) ≤ 1.0 (the old denominator produced
+cosine > 1.0 on some vectors).
+
+Measured after the fix, real EmbeddingGemma dataset (n=2000 + 100 queries,
+dim 768, same corpus as the table above), aarch64 release:
+
+| mode | recall@1 | recall@10 | bytes/vec | compression | scan cost |
+|---|---|---|---|---|---|
+| plain 4-bit | 0.910 | 0.958 | 514 | 5.98x | 1.00x |
+| plain + residual | **0.990** | **0.984** | 1.028 | ~3.0x | 1.43x |
+| usearch f32 HNSW | — | 0.995 | 3,072 | 1x | — |
+
+Honest labeling:
+- Residual roughly doubles the storage (second 4-bit block + second f16
+  scale) — it is a recall mode, not a free lunch. Plain stays the default.
+- The 1.43x scan cost is the second accumulate term; the cascade (#22)
+  remains the throughput lever and composes orthogonally.
+- The real-dataset comparison lives in
+  `crates/vecq-core/tests/real_residual_validation.rs` (ignored by default;
+  requires the dataset from `cto/scripts/gen_embeddings.py`). Re-run it in
+  release before merging any estimator/format change.
+- Plain-path numbers are unchanged by the fix by construction (single-term
+  path untouched); re-verified: `real`/`vs_usearch`/`vs_quantizers` recall
+  bit-identical to the baseline tables above.
+
 ## Conclusion
 
-The spike validates the technique: training-free 4-bit RHDH + Lloyd-Max
-quantization with asymmetric scoring keeps Recall@10 above 0.95 at ~6x
-compression on real Gemma embeddings. Recommended next steps:
+The spike validates the technique: training-free RHDH + Lloyd-Max
+quantization (4/5/6-bit, default 5-bit) with asymmetric scoring keeps
+Recall@10 well above 0.95 at 4.8–6x compression on real Gemma embeddings.
+Recommended next steps:
 
 1. ~~Explicit NEON nibble decode (target ≤ 0.8 ms/q at n=2k)~~ — done
    (explicit NEON + AVX2 nibble-gather paths with bit-identity tests)
