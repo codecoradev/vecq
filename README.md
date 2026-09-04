@@ -1,5 +1,10 @@
 # vecq
 
+[![CI](https://github.com/codecoradev/vecq/actions/workflows/ci.yml/badge.svg)](https://github.com/codecoradev/vecq/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/vecq-core.svg)](https://crates.io/crates/vecq-core)
+[![docs.rs](https://img.shields.io/docsrs/vecq-core)](https://docs.rs/vecq-core)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 > Training-free vector quantization at configurable width (4/5/6-bit) and search — the "SQLite profile" for vector storage on edge devices.
 
 `vecq` compresses dense embeddings **~5x** into a single deterministic file, using a zero-dependency pure-Rust crate. No training pass, no server, no C++.
@@ -12,6 +17,21 @@ vecq residual: 1,028 bytes/vector  (3.0x smaller, recall@10 0.984)
 ```
 
 It is the semantic-search engine for on-device and offline-first workloads — the layer below [uteke](https://github.com/codecoradev/uteke), the SQLite-based memory engine, where it is available as an optional search backend.
+
+## Installation
+
+```sh
+cargo add vecq-core
+```
+
+or in `Cargo.toml`:
+
+```toml
+[dependencies]
+vecq-core = "0.3"
+```
+
+The core crate is dependency-free — adding it pulls nothing beyond `std`. The benchmarking harness used for every number in this README lives in [`crates/vecq-bench`](crates/vecq-bench).
 
 ## Why vecq
 
@@ -45,6 +65,17 @@ Based on techniques validated in the RaBitQ / MonaVec line of research (random r
 | 4-bit + residual | 1,028 | 0.984 | 1.76 | maximum recall; fastest high-recall path |
 
 Real EmbeddingGemma, 768-dim, aarch64 release, n=2,000 — full methodology and the width matrix in [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
+
+<details>
+<summary>Reproduce</summary>
+
+```sh
+cargo run --release -p vecq-bench --bin widths   # full 4/5/6-bit + residual matrix
+cargo run --release -p vecq-bench --bin real     # recall/latency vs exact cosine ground truth
+```
+
+The dataset is 2,000 base vectors + 100 queries (768-dim) embedded with EmbeddingGemma 300M (Q4 ONNX) over a synthetic corpus — setup described in [`docs/BENCHMARK.md`](docs/BENCHMARK.md). Recall values are deterministic across runs and must match the tables bit-for-bit; latencies are aarch64-host numbers (ordering replicates everywhere, absolute times vary by machine).
+</details>
 
 ## Usage
 
@@ -114,6 +145,17 @@ let hits = index.search(&query, 10);
 ## Performance
 
 Default width (5-bit), aarch64, single-threaded, 2,000 real EmbeddingGemma vectors (768-dim): search **3.21 ms/query**, build **75 ms**, recall@10 **0.979**. The 4-bit width trades to 0.89 ms/query @ 0.958; residual trades up to 0.984 @ 1.76 ms/query. Full methodology, the width matrix, the usearch comparison, and the per-architecture scoring-path matrix (NEON / AVX2 / scalar, all bit-identical) in [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
+
+<details>
+<summary>Reproduce</summary>
+
+```sh
+cargo run --release -p vecq-bench --bin real        # recall + latency vs exact f32 cosine ground truth
+cargo run --release -p vecq-bench --bin vs_usearch  # head-to-head against usearch HNSW (f32)
+```
+
+Ground truth is exact brute-force cosine on the same queries. Recall is deterministic across runs; timings vary by host — the scoring-path matrix in [`docs/BENCHMARK.md`](docs/BENCHMARK.md) lists the expected per-architecture behavior.
+</details>
 
 ## Persistence & serving
 
