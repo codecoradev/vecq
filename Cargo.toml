@@ -8,7 +8,7 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/codecoradev/vecq"
 homepage = "https://github.com/codecoradev/vecq"
-keywords = ["vector", "quantization", "search", "embedded", "no-std"]
+keywords = ["vector", "quantization", "search", "embedded", "mobile"]
 categories = ["algorithms", "data-structures", "science"]
 authors = ["CodeCora <dev@codecora.dev>"]
 
