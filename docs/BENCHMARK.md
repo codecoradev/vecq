@@ -110,6 +110,30 @@ Findings:
   (r@10 0.772) — truncation quality is corpus-dependent, evaluate per
   workload.
 
+### Scale curve and positioning
+
+Same dataset, 5-bit default width, identical queries, ground truth recomputed
+per prefix:
+
+| N | recall@1 | recall@10 | ms/q | file |
+|---|---|---|---|---|
+| 2,000 | 0.940 | 0.977 | 3.2 | 1.3 MB |
+| 10,000 | 0.805 | 0.932 | 18.2 | 6.4 MB |
+| 100,000 | 0.350 | 0.850 | 168.8 | 64.2 MB |
+
+Positioning (deliberate, measured): vecq's sweet spot is the **local /
+on-device profile — up to roughly 10K vectors** — where it keeps recall@10
+≥ 0.93 at 4.78x compression with interactive single-thread latency. Beyond
+that, the constraint is not scan speed but neighbor geometry: as N grows the
+true top-10 margins collapse (avg 10th-vs-11th margin 2.0e-3 at 2K vs
+3.6e-4 at 100K on this corpus), so ~1e-3 quantization noise reorders
+identity-level rankings. Notably, when vecq's top-1 differs from the exact
+top-1 at 100K, the f32 quality gap is tiny (avg 2.1e-5) — the returned
+neighbor is nearly as good, just not the same vector. Workloads that need
+strict identity recall at 10^5+ vectors should use f32 or a trained
+higher-precision index; a parallel scan (#51) would fix latency at server N
+but not this recall ceiling.
+
 ## Changelog vs first spike measurement
 
 - **Search 1.75x faster** (3.32 → 0.89 ms/q after NEON + batching): the scoring loop now uses a

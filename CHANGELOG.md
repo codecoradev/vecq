@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
-- Server-scale benchmark profile (#52): seeded 100K-vector dataset generator (`scripts/gen_dataset.py`) and a `server_scale` harness measuring plain / `working_dim=256` / cascade modes against exact f32 ground truth, with results and findings in the new "Server scale" section of `docs/BENCHMARK.md`. Headline: compression holds at 4.78x/100K, recall is N-dependent (5-bit r@10 0.974 → 0.850), and the 2-bit cascade is not a single-threaded throughput win at server N.
+- Server-scale benchmark profile (#52): seeded 100K-vector dataset generator (`scripts/gen_dataset.py`) and a `server_scale` harness measuring plain / `working_dim=256` / cascade modes against exact f32 ground truth, with results, a 2K/10K/100K scale curve, and positioning in the new "Server scale" section of `docs/BENCHMARK.md`. Headline: compression holds at 4.78x/100K; recall is N-dependent (5-bit r@10 0.974 → 0.850) because true-neighbor margins collapse as N grows — vecq's measured sweet spot is the local/on-device profile up to ~10K vectors (r@10 0.932 @ 18 ms/q single-thread); the 2-bit cascade is not a single-threaded throughput win at server N.
 
 ## [0.3.0] — 2026-08-30
 
