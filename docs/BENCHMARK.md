@@ -4,7 +4,9 @@ Spike results, measured on aarch64 (Oracle ARM host), single-threaded, release p
 
 ## Setup
 
-- Dataset: 2,000 base vectors + 100 queries, dim 768
+- Dataset: 2,000 base vectors + 100 queries, dim 768 (a second, server-scale
+  profile with 100,000 base vectors + 200 queries is documented in
+  [Server scale](#server-scale-issue-52) below)
 - Embeddings: real **EmbeddingGemma 300M** (Q4 ONNX) over a synthetic corpus of
   18 topics × 10 modifiers (structured paragraphs, memory-note style)
 - Ground truth: exact f32 cosine brute-force
@@ -40,6 +42,73 @@ All modes on the same dataset, aarch64 release, post wide-kernel:
   tables, so vector gather needs a range-split (≈2–3x the 4-bit gather cost).
   Split-layout codes (separate nibble/high-bit streams) project only
   ~2.2–2.7 ms/q — tracked with the full analysis in issue #40.
+
+## Server scale (issue #52)
+
+Same pipeline as the edge profile, scaled to 100,000 base vectors + 200
+queries (dim 768), measured single-threaded on aarch64 (Oracle ARM host,
+4 cores), release profile:
+
+| mode | build | file | B/vec | ms/q | recall@1 | recall@10 |
+|---|---|---|---|---|---|---|
+| f32 brute force (GT reference) | — | 307.2 MB | 3,072 | 61.0 | 1.000 (ref) | 1.000 (ref) |
+| plain 5-bit view (default) | 4.3 s | 64.2 MB | 642 | 168.8 | 0.350 | 0.850 |
+| plain 5-bit view, wd=256 | 1.0 s | 16.2 MB | 162 | 42.2 | 0.400 | 0.772 |
+| plain 4-bit view | 3.5 s | 51.4 MB | 514 | 51.2 | 0.355 | 0.818 |
+| cascade 4-bit r=50 | — | 51.4 MB | 514 | 77.4 | 0.375 | 0.817 |
+| cascade 4-bit r=100 | — | 51.4 MB | 514 | 79.5 | 0.380 | 0.817 |
+| cascade 4-bit r=200 | — | 51.4 MB | 514 | 78.9 | 0.345 | 0.818 |
+| cascade 4-bit r=400 | — | 51.4 MB | 514 | 80.5 | 0.345 | 0.818 |
+
+Reproduce:
+
+```sh
+python3 scripts/gen_dataset.py --n-base 100000 --n-query 200 --out /tmp/vecq-bench-100k
+cargo run --release -p vecq-bench --bin server_scale
+```
+
+Methodology (honest labeling):
+
+- The dataset is seeded and reproducible; the corpus builder is byte-identical
+  to the edge profile's, so the server base set is a strict superset of the
+  edge one. The published run embedded the corpus on x86 (Modal CPU workers,
+  onnxruntime 1.25.0) using the same model files and the same generator code —
+  embeddings from the two runtimes agree at cosine ≥ 0.9996 on a 64-vector
+  probe — while every vecq-side number (quantization, search, ground truth)
+  is measured on the aarch64 host against exactly this persisted dataset.
+- All rows are scored against the **persisted f16 artifact** (mmap'd view or
+  file-reloaded index), not in-memory f32-scale state: f16 scales perturb
+  scores by ≤ ~5e-4, which reorders tie-heavy top-10 lists, so mixing the two
+  representations makes columns incomparable (`scale_probe` harness documents
+  the delta). Cascade signatures are derived in memory from the reloaded
+  codes, as a serving process would.
+- Recall values are deterministic for a given dataset; timings are
+  host-specific. The edge-profile recall tables are unaffected.
+
+Findings:
+
+- **Storage and build scale linearly and hold**: 4.78x compression at 100K
+  (64.2 MB vs 307.2 MB), 4.3 s single-threaded build. The compression story
+  does not degrade with N — a 100K × 768 index fits in ~64 MB of RAM or page
+  cache.
+- **Recall is N-dependent**: with 50x more data the true top-10 neighbors sit
+  much closer together, and ~1e-3 quantization noise flips rankings — 5-bit
+  recall@10 falls 0.974 → 0.850 and recall@1 0.940 → 0.350 (4-bit: 0.957 →
+  0.818). Where recall at server N matters, the available levers are 6-bit /
+  residual (edge-profile recall advantage carries structurally, at their
+  storage cost) — measure on your corpus before committing.
+- **Single-thread scan at server N**: 5/6-bit scoring is extraction-bound and
+  at 100K loses to exact f32 brute force (169 vs 61 ms/q); only 4-bit
+  (51 ms/q) and wd=256 (42 ms/q) stay ahead of the f32 scan. vecq's server
+  pitch at this N is the footprint, not raw single-thread latency.
+- **Cascade (#22) is not the server-scale throughput lever**: prefilter + r
+  rescore costs as much as the whole plain 4-bit scan (77–80 vs 51 ms/q) at
+  equal recall (r ≥ 200 saturates to plain). The remaining lever is a
+  parallel scan (#51): same kernels over chunks + fixed-order merge.
+- **wd=256 (Matryoshka truncation)**: 19x compression vs f32 (162 B/vec) and
+  the fastest scan, but recall on this 18-topic corpus is materially lower
+  (r@10 0.772) — truncation quality is corpus-dependent, evaluate per
+  workload.
 
 ## Changelog vs first spike measurement
 
