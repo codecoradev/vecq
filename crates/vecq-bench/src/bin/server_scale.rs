@@ -187,14 +187,17 @@ fn main() {
     for (bits, wd, name, note) in [
         (5u8, dim, "server_5bit_full", "default width"),
         (5, 256, "server_5bit_wd256", "Matryoshka working_dim"),
+        (6, dim, "server_6bit_full", "recall lever"),
     ] {
         let (idx, build) = build_index(dim, wd, bits, &base);
         let (path, file_bytes) = write_index(&dir, name, &idx);
         drop(idx);
         let (ms_q, r1, r10) = bench_view(&path, &queries, gts);
         rows.push(Row {
-            mode: if wd == dim {
+            mode: if wd == dim && bits == 5 {
                 "plain 5-bit view (default)".to_string()
+            } else if bits == 6 {
+                "plain 6-bit view".to_string()
             } else {
                 format!("plain 5-bit view, wd={wd}")
             },
@@ -204,6 +207,28 @@ fn main() {
             recall1: r1,
             recall10: r10,
             note,
+        });
+    }
+
+    // -- plain 4-bit + residual (recall lever), through an mmap view --------
+    {
+        let t0 = Instant::now();
+        let mut idx = VecqIndex::with_residual(dim, 42);
+        for v in &base {
+            idx.add(v);
+        }
+        let build = t0.elapsed();
+        let (path, file_bytes) = write_index(&dir, "server_resid_full", &idx);
+        drop(idx);
+        let (ms_q, r1, r10) = bench_view(&path, &queries, gts);
+        rows.push(Row {
+            mode: "plain 4-bit + residual view".to_string(),
+            build: Some(build),
+            file_bytes,
+            ms_q,
+            recall1: r1,
+            recall10: r10,
+            note: "recall lever",
         });
     }
 

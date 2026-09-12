@@ -51,14 +51,16 @@ queries (dim 768), measured single-threaded on aarch64 (Oracle ARM host,
 
 | mode | build | file | B/vec | ms/q | recall@1 | recall@10 |
 |---|---|---|---|---|---|---|
-| f32 brute force (GT reference) | — | 307.2 MB | 3,072 | 61.0 | 1.000 (ref) | 1.000 (ref) |
-| plain 5-bit view (default) | 4.3 s | 64.2 MB | 642 | 168.8 | 0.350 | 0.850 |
-| plain 5-bit view, wd=256 | 1.0 s | 16.2 MB | 162 | 42.2 | 0.400 | 0.772 |
-| plain 4-bit view | 3.5 s | 51.4 MB | 514 | 51.2 | 0.355 | 0.818 |
-| cascade 4-bit r=50 | — | 51.4 MB | 514 | 77.4 | 0.375 | 0.817 |
-| cascade 4-bit r=100 | — | 51.4 MB | 514 | 79.5 | 0.380 | 0.817 |
-| cascade 4-bit r=200 | — | 51.4 MB | 514 | 78.9 | 0.345 | 0.818 |
-| cascade 4-bit r=400 | — | 51.4 MB | 514 | 80.5 | 0.345 | 0.818 |
+| f32 brute force (GT reference) | — | 307.2 MB | 3,072 | 59.8 | 1.000 (ref) | 1.000 (ref) |
+| plain 5-bit view (default) | 3.8 s | 64.2 MB | 642 | 167.3 | 0.350 | 0.850 |
+| plain 5-bit view, wd=256 | 1.0 s | 16.2 MB | 162 | 41.5 | 0.400 | 0.772 |
+| plain 6-bit view | 4.3 s | 77.0 MB | 770 | 170.6 | 0.350 | 0.856 |
+| plain 4-bit + residual view | 6.3 s | 102.8 MB | 1,028 | 98.8 | 0.320 | 0.836 |
+| plain 4-bit view | 3.5 s | 51.4 MB | 514 | 48.0 | 0.355 | 0.818 |
+| cascade 4-bit r=50 | — | 51.4 MB | 514 | 74.5 | 0.375 | 0.817 |
+| cascade 4-bit r=100 | — | 51.4 MB | 514 | 75.2 | 0.380 | 0.817 |
+| cascade 4-bit r=200 | — | 51.4 MB | 514 | 72.4 | 0.345 | 0.818 |
+| cascade 4-bit r=400 | — | 51.4 MB | 514 | 76.3 | 0.345 | 0.818 |
 
 Reproduce:
 
@@ -98,11 +100,12 @@ Findings:
   residual (edge-profile recall advantage carries structurally, at their
   storage cost) — measure on your corpus before committing.
 - **Single-thread scan at server N**: 5/6-bit scoring is extraction-bound and
-  at 100K loses to exact f32 brute force (169 vs 61 ms/q); only 4-bit
-  (51 ms/q) and wd=256 (42 ms/q) stay ahead of the f32 scan. vecq's server
-  pitch at this N is the footprint, not raw single-thread latency.
+  at 100K loses to exact f32 brute force (167/171 vs 60 ms/q; the residual
+  mode at 99 ms/q also trails), while only 4-bit (48 ms/q) and wd=256
+  (42 ms/q) stay ahead of the f32 scan. vecq's server pitch at this N is the
+  footprint, not raw single-thread latency.
 - **Cascade (#22) is not the server-scale throughput lever**: prefilter + r
-  rescore costs as much as the whole plain 4-bit scan (77–80 vs 51 ms/q) at
+  rescore costs as much as the whole plain 4-bit scan (72–76 vs 48 ms/q) at
   equal recall (r ≥ 200 saturates to plain). The remaining lever is a
   parallel scan (#51): same kernels over chunks + fixed-order merge.
 - **wd=256 (Matryoshka truncation)**: 19x compression vs f32 (162 B/vec) and
@@ -112,18 +115,38 @@ Findings:
 
 ### Scale curve and positioning
 
-Same dataset, 5-bit default width, identical queries, ground truth recomputed
-per prefix:
+Same dataset, identical queries, ground truth recomputed per prefix. The
+10K point runs the same `server_scale` harness over the first 10,000 base
+vectors; recall values are deterministic (identical across runs), timings
+are from a quiet host:
+
+**10,000 vectors (local/on-device scale):**
+
+| mode | build | B/vec | ms/q | recall@1 | recall@10 |
+|---|---|---|---|---|---|
+| plain 5-bit view (default) | 0.38 s | 642 | 16.5 | 0.805 | 0.932 |
+| plain 5-bit view, wd=256 | 0.10 s | 162 | 4.1 | 0.735 | 0.831 |
+| plain 6-bit view | 0.42 s | 770 | 16.7 | 0.795 | 0.949 |
+| plain 4-bit + residual view | 0.59 s | 1,028 | 9.0 | 0.810 | 0.951 |
+| plain 4-bit view | 0.34 s | 514 | 4.5 | 0.790 | 0.914 |
+| f32 brute force (GT reference) | — | 3,072 | 5.9 | 1.000 (ref) | 1.000 (ref) |
+
+The edge-profile mode hierarchy carries over intact: 6-bit and residual
+remain the recall levers (r@10 0.95 at 10K), residual stays the fastest
+high-recall path, and the compression story holds at every width.
+
+**Scale curve, 5-bit default:**
 
 | N | recall@1 | recall@10 | ms/q | file |
 |---|---|---|---|---|
 | 2,000 | 0.940 | 0.977 | 3.2 | 1.3 MB |
-| 10,000 | 0.805 | 0.932 | 18.2 | 6.4 MB |
-| 100,000 | 0.350 | 0.850 | 168.8 | 64.2 MB |
+| 10,000 | 0.805 | 0.932 | 16.5 | 6.4 MB |
+| 100,000 | 0.350 | 0.850 | 167.3 | 64.2 MB |
 
 Positioning (deliberate, measured): vecq's sweet spot is the **local /
 on-device profile — up to roughly 10K vectors** — where it keeps recall@10
-≥ 0.93 at 4.78x compression with interactive single-thread latency. Beyond
+≥ 0.93 at 4.78x compression with interactive single-thread latency (and
+≥ 0.95 with the residual recall lever). Beyond
 that, the constraint is not scan speed but neighbor geometry: as N grows the
 true top-10 margins collapse (avg 10th-vs-11th margin 2.0e-3 at 2K vs
 3.6e-4 at 100K on this corpus), so ~1e-3 quantization noise reorders
