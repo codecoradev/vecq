@@ -1,10 +1,13 @@
 [package]
 name = "vecq-core"
-description = "Training-free RHDH + Lloyd-Max 4-bit vector quantization with asymmetric scoring"
+description = "Training-free vector quantization (4/5/6-bit) and search — the SQLite profile for edge vector storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 authors.workspace = true
 readme = "../../README.md"
 exclude = ["benches"]

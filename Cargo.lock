@@ -2193,9 +2193,9 @@ dependencies = [
 
 [[package]]
 name = "usearch"
-version = "2.26.1"
+version = "2.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "884002b91c545f43b67e9eadbef70834502ad14c32df1ce8d72bdb56ab7d8be3"
+checksum = "b43f3a7c8d3b100d53c1a34e9ce4cd76cc83627bdb4fcd035d4e82102778aeee"
 dependencies = [
  "cxx",
  "cxx-build",
@@ -2216,7 +2216,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vecq-bench"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "memmap2",
  "rabitq-rs",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "vecq-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rand 0.10.2",
 ]

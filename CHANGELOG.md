@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.1] — 2026-09-14
+
+### Added
+- Server-scale benchmark profile (#52): seeded 100K-vector dataset generator (`scripts/gen_dataset.py`) and a `server_scale` harness measuring plain / `working_dim=256` / cascade modes against exact f32 ground truth, with results, a 2K/10K/100K scale curve, and positioning in the new "Server scale" section of `docs/BENCHMARK.md`. Headline: compression holds at 4.78x/100K; recall is N-dependent (5-bit r@10 0.974 → 0.850) because true-neighbor margins collapse as N grows — vecq's measured sweet spot is the local/on-device profile up to ~10K vectors (r@10 0.932 @ 18 ms/q single-thread); the 2-bit cascade is not a single-threaded throughput win at server N.
+
+### Changed
+- Crate metadata honesty pass (#49): new `vecq-core` description — "Training-free vector quantization (4/5/6-bit) and search — the SQLite profile for edge vector storage" — plus `homepage`, `keywords`, and `categories`, so the crates.io page reflects the current scope; README gains badges and benchmark-reproduce folds.
+- Dependency/CI bumps: `softprops/action-gh-release` 2 → 3 (#48), usearch 2.26.1 → 2.26.2 in the bench harness (#50). No library code changes since 0.3.0.
+
 ## [0.3.0] — 2026-08-30
 
 ### Added
