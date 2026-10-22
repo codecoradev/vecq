@@ -15,7 +15,6 @@ This document helps you decide *whether* and *how* to contribute in a way that's
 1. Fork, branch from `develop` (feature branches only; `main` and `develop` are protected).
 2. `cargo fmt --all && cargo clippy --all-targets -- -D warnings && cargo test --workspace` must pass locally.
 3. Open a PR against `develop`. CI runs fmt/clippy/test/build on every PR.
-4. Sign the CLA when the bot asks.
 
 ## What gets merged fast
 
@@ -33,18 +32,9 @@ This document helps you decide *whether* and *how* to contribute in a way that's
 
 See [SECURITY.md](SECURITY.md).
 
-## CLA
+## License
 
-All contributions (code, docs, tests, configuration) require a signed
-Contributor License Agreement before a pull request can be merged:
-
-- 📋 **Individual?** → [Sign the Individual CLA](https://codecoradev.github.io/cla/?type=individual)
-- 🏢 **Contributing on behalf of a company?** → [Sign the Corporate CLA](https://codecoradev.github.io/cla/?type=corporate)
-
-The CLA is a license agreement, not a copyright assignment — you keep
-ownership of your work. Signing takes a couple of minutes and is stored
-in the [codecoradev/.github](https://github.com/codecoradev/.github)
-repository; a bot checks it automatically on every pull request.
+Contributions are licensed to the project under the Apache-2.0 license (inbound = outbound). No additional agreement is required.
 
 ## Contributions are unpaid
 
