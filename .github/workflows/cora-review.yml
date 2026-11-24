@@ -34,5 +34,5 @@ jobs:
           cora-base-url: ${{ secrets.CORA_BASE_URL }}
           cora-model: ${{ secrets.CORA_MODEL }}
 
-          review-timeout-seconds: ${{ secrets.CORA_REVIEW_TIMEOUT_SECONDS }}
-          max-attempts: ${{ secrets.CORA_MAX_ATTEMPTS }}
+          review-timeout-seconds: ${{ vars.CORA_REVIEW_TIMEOUT_SECONDS || secrets.CORA_REVIEW_TIMEOUT_SECONDS }}
+          max-attempts: ${{ vars.CORA_MAX_ATTEMPTS || secrets.CORA_MAX_ATTEMPTS }}
